@@ -1,15 +1,30 @@
 from fastapi import FastAPI
-from app.api.preprocessing_routes import router as preproc_router
-from app.api.embedding_routes import router as embedding_router
-from app.api.cluster_routes import router as cluster_router
-from app.api.naming_routes import router as naming_router
+from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 
-app = FastAPI(title="Preprocessing API")
-app.include_router(preproc_router)
-app.include_router(embedding_router)
-app.include_router(cluster_router)
-app.include_router(naming_router)
+load_dotenv()  # .env 파일 로드
+
+from app.core import embedding, preprocess, clustering, tech_naming
+from app.api import pipeline
+app = FastAPI(title="Spri AI Pipeline", version="1.0")
+
+# CORS 설정 (React용)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 필요 시 특정 도메인만 지정
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 라우터 등록
+app.include_router(preprocess.router, prefix="/api")
+app.include_router(embedding.router, prefix="/api")
+app.include_router(clustering.router, prefix="/api")
+app.include_router(tech_naming.router, prefix="/api")
+
+app.include_router(pipeline.router, prefix="/api")
 
 @app.get("/")
-def health():
-    return {"status": "ok"}
+def root():
+    return {"message": "Spri AI Pipeline API is running 🚀"}
