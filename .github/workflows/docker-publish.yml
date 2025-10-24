@@ -3,7 +3,7 @@ name: Build & Push Docker Image
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:  # 수동 실행도 가능하게
+  workflow_dispatch:
 
 jobs:
   build:
@@ -25,7 +25,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and Push
+      - name: Build and Push (with cache)
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -34,3 +34,6 @@ jobs:
           tags: |
             hongseonah03/spri2026-api:latest
             hongseonah03/spri2026-api:${{ github.sha }}
+          # 🔹 BuildKit 캐시 활성화
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
