@@ -1,6 +1,6 @@
-from fastapi import APIRouter
 from __future__ import annotations
 
+from fastapi import APIRouter
 import json
 import re
 from typing import Iterable, IO, Tuple, Optional
@@ -93,7 +93,8 @@ def filter_df_before_year(df: pd.DataFrame, cutoff_year: int) -> pd.DataFrame:
 # -----------------------------
 # 공개 전처리 엔트리포인트
 # -----------------------------
-def run_preprocess(df: pd.DataFrame) -> pd.DataFrame:
+def run_preprocess(df: pd.DataFrame, cutoff_year: int | None = None, **kwargs) -> pd.DataFrame:
+
     """
     파이프라인에서 호출되는 전처리 함수.
     - 텍스트(제목/초록)는 그대로 둠 (결과 동일성 유지)
