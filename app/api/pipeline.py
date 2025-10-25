@@ -161,7 +161,8 @@ async def run_pipeline(
 
             # 2) 전처리
             yield json.dumps({"step": "데이터 전처리 시작", "progress": 10}) + "\n"
-            df_clean = await asyncio.to_thread(run_preprocess, df, int(cutoff_year))
+            # 여기서 cutoff_year 인자를 넘겨줌
+            df_clean = await asyncio.to_thread(run_preprocess, df, cutoff_year=cutoff_year)
 
             # 3) 임베딩
             yield json.dumps({"step": "임베딩 생성 중", "progress": 40}) + "\n"
