@@ -1,6 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+import os
+
+# HuggingFace tokenizer 멀티프로세스 경고 방지
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 load_dotenv()  # .env 파일 로드
 

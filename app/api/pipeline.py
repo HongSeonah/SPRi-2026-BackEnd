@@ -185,6 +185,10 @@ async def run_pipeline(
             yield json.dumps({"step": "임베딩 생성 중", "progress": 40}) + "\n"
             df_embed = await asyncio.to_thread(run_embedding, df_filtered, model_name)
 
+            # 안전 확인
+            if not isinstance(df_embed, pd.DataFrame):
+                raise TypeError(f"run_embedding must return a DataFrame, got {type(df_embed)}")
+
             # 4) 클러스터링/추세
             yield json.dumps({"step": "클러스터링 및 추세 분석 중", "progress": 70}) + "\n"
             df_clustered, summary = await asyncio.to_thread(run_clustering, df_embed, n_clusters)
