@@ -6,6 +6,7 @@ import re
 from typing import Iterable, IO, Tuple, Optional
 
 import pandas as pd
+import inspect, sys
 router = APIRouter()
 
 # -----------------------------
@@ -127,5 +128,7 @@ def run_preprocess(df: pd.DataFrame, cutoff_year: int = 2025, **kwargs) -> pd.Da
         out = out[out[title_col].str.len() > 0]
     elif abstr_col:
         out = out[out[abstr_col].str.len() > 0]
+
+    print("[preprocess] using", __file__, "sig:", inspect.signature(run_preprocess), file=sys.stderr)
 
     return out.reset_index(drop=True)
