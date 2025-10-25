@@ -93,7 +93,7 @@ def filter_df_before_year(df: pd.DataFrame, cutoff_year: int) -> pd.DataFrame:
 # -----------------------------
 # 공개 전처리 엔트리포인트
 # -----------------------------
-def run_preprocess(df: pd.DataFrame, cutoff_year: int | None = None, **kwargs) -> pd.DataFrame:
+def run_preprocess(df: pd.DataFrame, cutoff_year: int = 2025, **kwargs) -> pd.DataFrame:
 
     """
     파이프라인에서 호출되는 전처리 함수.
