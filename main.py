@@ -18,10 +18,10 @@ app.add_middleware(
 )
 
 # 라우터 등록
-app.include_router(preprocess.router, prefix="/api")
-app.include_router(embedding.router, prefix="/api")
-app.include_router(clustering.router, prefix="/api")
-app.include_router(tech_naming.router, prefix="/api")
+# app.include_router(preprocess.router, prefix="/api")
+# app.include_router(embedding.router, prefix="/api")
+# app.include_router(clustering.router, prefix="/api")
+# app.include_router(tech_naming.router, prefix="/api")
 
 app.include_router(pipeline.router, prefix="/api")
 

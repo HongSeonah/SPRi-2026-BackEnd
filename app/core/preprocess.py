@@ -6,6 +6,10 @@ from typing import Iterable, IO
 import pandas as pd
 import re
 
+from fastapi import APIRouter
+
+router = APIRouter()
+
 # -----------------------------
 # JSONL 유틸 (필요시 외부 스크립트와 동일 동작을 위한 도우미)
 # -----------------------------
