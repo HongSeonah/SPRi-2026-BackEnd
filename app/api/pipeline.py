@@ -1,10 +1,15 @@
+# app/api/pipeline.py
 import asyncio
+import io
+import csv
+import json
+from typing import Any, Tuple
+
+import pandas as pd
 from fastapi import APIRouter, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
-import io, csv, json
-import pandas as pd
 
-from app.core.preprocess import run_preprocess
+from app.core.preprocess import run_preprocess, filter_df_before_year
 from app.core.embedding import run_embedding
 from app.core.clustering import run_clustering
 from app.core.tech_naming import run_tech_naming
@@ -12,13 +17,17 @@ from app.core.utils_prompt import build_user_prompt
 
 router = APIRouter(tags=["Pipeline"])
 
+# --------- 업로드 파일 → DataFrame 로더 (JSONL 우선) ---------
 def _load_table_from_upload(
     file_bytes: bytes,
     filename: str | None = None,
     content_type: str | None = None,
     prefer_jsonl: bool = True,
-):
-    """업로드 파일을 DataFrame으로 로딩 (JSONL 우선, JSON/CSV/TSV/Excel도 지원)"""
+) -> Tuple[pd.DataFrame, dict]:
+    """
+    업로드 파일을 DataFrame으로 로딩 (JSONL 우선, JSON/CSV/TSV/Excel도 지원)
+    반환: (df, meta)
+    """
     name = (filename or "").lower().strip()
     ctype = (content_type or "").lower().strip()
     encodings = ["utf-8-sig", "utf-8", "cp949", "euc-kr", "latin-1"]
@@ -131,6 +140,20 @@ def _load_table_from_upload(
     raise ValueError(f"Failed to parse as CSV/TSV. Last error: {last_err}")
 
 
+# --------- 안전 리스트 변환 (요약값 방어) ---------
+def _to_str_list(x: Any) -> list[str]:
+    import pandas as pd
+    if x is None:
+        return []
+    if isinstance(x, (list, tuple)):
+        return [str(v) for v in x]
+    if isinstance(x, pd.Series):
+        return x.dropna().astype(str).tolist()
+    if isinstance(x, pd.DataFrame):
+        return x.astype(str).stack().tolist()
+    return [str(x)]
+
+
 @router.post("/pipeline/run")
 async def run_pipeline(
     file: UploadFile = File(...),
@@ -138,6 +161,7 @@ async def run_pipeline(
     n_clusters: int = Form(100),
     model_name: str = Form("all-MiniLM-L6-v2"),
 ):
+    # 업로드 전체 바이트를 미리 읽어둠 (stream 함수 내부에서 await 불가)
     file_bytes = await file.read()
     filename = file.filename
     content_type = file.content_type
@@ -149,34 +173,43 @@ async def run_pipeline(
             df, meta = await asyncio.to_thread(_load_table_from_upload, file_bytes, filename, content_type, True)
             yield json.dumps({"step": "파일 로드 완료", "progress": 5, "meta": {"filename": filename, "content_type": content_type, **meta}}) + "\n"
 
-            # 1) year 파생 (없으면 update_date에서 추출)
-            if "year" not in df.columns:
-                if "update_date" in df.columns:
-                    df["year"] = (
-                        df["update_date"].astype(str).str.extract(r"(\d{4})")[0]
-                        .fillna("-1").astype(int)
-                    )
-                else:
-                    df["year"] = -1
-
-            # 2) 전처리
+            # 1) 전처리 (연도 파생 포함)
             yield json.dumps({"step": "데이터 전처리 시작", "progress": 10}) + "\n"
-            # 여기서 cutoff_year 인자를 넘겨줌
-            df_clean = await asyncio.to_thread(run_preprocess, df, cutoff_year=cutoff_year)
+            df_clean = await asyncio.to_thread(run_preprocess, df, int(cutoff_year))
+
+            # 2) (선택) 원문 규칙과 동일 부등식(< cutoff_year)로 필터링이 필요하면 아래 사용
+            #    외부 스크립트와 결과 동일성 필요할 때 켜면 됨.
+            df_filtered = await asyncio.to_thread(filter_df_before_year, df_clean, int(cutoff_year))
 
             # 3) 임베딩
             yield json.dumps({"step": "임베딩 생성 중", "progress": 40}) + "\n"
-            df_embed = await asyncio.to_thread(run_embedding, df_clean, model_name)
+            df_embed = await asyncio.to_thread(run_embedding, df_filtered, model_name)
 
             # 4) 클러스터링/추세
             yield json.dumps({"step": "클러스터링 및 추세 분석 중", "progress": 70}) + "\n"
             df_clustered, summary = await asyncio.to_thread(run_clustering, df_embed, n_clusters)
 
-            # 5) 기술명명
+            # 5) 기술명명 (요약값 강제 정규화)
             yield json.dumps({"step": "기술명 생성 중", "progress": 90}) + "\n"
-            keywords = summary.get("keywords", [])
-            titles = summary.get("titles", [])
-            year_val = int(df_clustered["year"].max()) if "year" in df_clustered.columns else 2024
+
+            if isinstance(summary, dict):
+                kw_raw = summary.get("keywords", [])
+                tt_raw = summary.get("titles", [])
+            else:
+                # dict가 아닌 경우(Series/DataFrame/Namespace 등) 속성으로 접근
+                kw_raw = getattr(summary, "keywords", [])
+                tt_raw = getattr(summary, "titles", [])
+
+            keywords = _to_str_list(kw_raw)
+            titles   = _to_str_list(tt_raw)
+
+            year_val = 2024
+            if isinstance(df_clustered, pd.DataFrame) and "year" in df_clustered.columns:
+                try:
+                    year_val = int(pd.to_numeric(df_clustered["year"], errors="coerce").max())
+                except Exception:
+                    year_val = 2024
+
             prompt = build_user_prompt(
                 flow_id="AUTO_FLOW",
                 cluster_name="자동생성_클러스터",
@@ -187,7 +220,11 @@ async def run_pipeline(
             naming_result = await asyncio.to_thread(run_tech_naming, prompt)
 
             # 완료
-            yield json.dumps({"step": "완료", "progress": 100, "result": {"summary": summary, "naming": naming_result}}) + "\n"
+            yield json.dumps({
+                "step": "완료",
+                "progress": 100,
+                "result": {"summary": summary if isinstance(summary, dict) else str(type(summary)), "naming": naming_result}
+            }) + "\n"
 
         except Exception as e:
             yield json.dumps({"step": "오류 발생", "progress": -1, "error": str(e)}) + "\n"
