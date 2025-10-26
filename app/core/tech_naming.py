@@ -1,24 +1,41 @@
 # app/core/tech_naming.py
 # ============================================================
-#  기술 네이밍 생성기 (Hybrid + Flow-Aggregated)
-#  - 중간 산출물은 artifacts로 주입받아 메모리에서 사용
+#  기술 네이밍 생성기 (Hybrid + Flow-Aggregated) — 개선판
+#  - OpenAI 호출 병렬화로 처리시간 단축 → 프록시/서버 타임아웃 리스크 완화
+#  - 재시도: 지수 백오프 + 지터, 429/5xx 내성 강화
+#  - METHOD: A(둘다)/H(하이브리드만)/F(플로우집계만)
 #  - 최종 네이밍 CSV만 OUTPUT_DIR에 저장
+#  - 주요 튜닝 ENV:
+#     * OUTPUT_DIR       (기본: /var/lib/app/outputs)
+#     * LABEL_SUFFIX     (메타)
+#     * METHOD           (A|H|F, 기본 A)
+#     * OPENAI_MODEL     (기본: gpt-4o-mini)
+#     * MAX_WORKERS      (동시 호출 수, 기본 4)
+#     * REQUEST_TIMEOUT  (OpenAI 단건 타임아웃, 기본 60s)
+#     * GPT_RETRY        (기본 4)
+#     * BACKOFF_BASE     (기본 1.5)
 # ============================================================
 
 from __future__ import annotations
-import os, re, json, time
+import os, re, json, time, random
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------- Env / Paths ----------------
-# 최종 저장 경로만 사용 (쿠버/로컬 모두 OUTPUT_DIR로 제어)
 OUTPUT_DIR   = Path(os.getenv("OUTPUT_DIR", "/var/lib/app/outputs")).resolve()
 LABEL_SUFFIX = os.getenv("LABEL_SUFFIX", "k100")   # 메타 표기용
-METHOD       = os.getenv("METHOD", "A")
+METHOD       = os.getenv("METHOD", "A").upper().strip()
 OUT_HYBRID   = OUTPUT_DIR / "names_generated_hybrid.csv"
 OUT_FLOWAG   = OUTPUT_DIR / "names_generated_flowagg.csv"
+
+# 튜닝 파라미터
+MAX_WORKERS       = max(1, int(os.getenv("MAX_WORKERS", "4")))
+REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT", "60"))
+GPT_RETRY         = max(1, int(os.getenv("GPT_RETRY", "4")))
+BACKOFF_BASE      = float(os.getenv("BACKOFF_BASE", "1.5"))
 
 # ---------------- OpenAI ----------------
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -80,7 +97,8 @@ def _extract_json(txt: str) -> Dict[str, Any]:
             kv[mm.group(1)] = mm.group(2).strip()
     return kv if kv else {}
 
-def _call_gpt(user_prompt: str, sys_prompt: str, retry=5, sleep=2.0) -> Dict:
+def _call_gpt(user_prompt: str, sys_prompt: str, retry: int = GPT_RETRY) -> Dict:
+    """OpenAI 호출: 재시도(지수 백오프+지터), v1 우선"""
     _ensure_openai()
     last_err = None
     for i in range(retry):
@@ -92,7 +110,7 @@ def _call_gpt(user_prompt: str, sys_prompt: str, retry=5, sleep=2.0) -> Dict:
                               {"role":"user","content":user_prompt}],
                     temperature=0.35,
                     response_format={"type":"json_object"},
-                    timeout=90,
+                    timeout=REQUEST_TIMEOUT_S,
                 )
                 raw = resp.choices[0].message.content or "{}"
             else:
@@ -101,7 +119,7 @@ def _call_gpt(user_prompt: str, sys_prompt: str, retry=5, sleep=2.0) -> Dict:
                     messages=[{"role":"system","content":sys_prompt},
                               {"role":"user","content":user_prompt}],
                     temperature=0.35,
-                    request_timeout=90
+                    request_timeout=REQUEST_TIMEOUT_S
                 )
                 raw = resp["choices"][0]["message"]["content"]
             try: data = json.loads(raw)
@@ -110,7 +128,10 @@ def _call_gpt(user_prompt: str, sys_prompt: str, retry=5, sleep=2.0) -> Dict:
             return data
         except Exception as e:
             last_err = e
-            time.sleep(sleep*(i+1))
+            # 429/5xx/네트워크 등에 대해 백오프
+            sleep_s = (BACKOFF_BASE ** i) + random.uniform(0.0, 0.5)
+            time.sleep(sleep_s)
+    # 재시도 실패
     raise last_err
 
 # ---------------- 패널 재구성 ----------------
@@ -219,12 +240,22 @@ def _load_top_terms_artifacts(artifacts: Dict[str, Any], year:int, cluster_id:in
     sub = df[df["cluster_id"]==int(cluster_id)].sort_values("tfidf", ascending=False).head(topk)
     return sub["term"].astype(str).tolist()
 
+# ---- 병렬 실행 유틸
+def _as_completed_results(futures):
+    for fut in as_completed(futures):
+        try:
+            yield fut.result()
+        except Exception as e:
+            # 호출 단에서 메시지로 변환해 반환하도록 함
+            yield {"status": f"error: {type(e).__name__}: {e}"}
+
 def _run_hybrid(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[str, Any]) -> Path:
     rows_out = []
     last_nodes = (panel.sort_values("year").groupby("flow_id").tail(1).reset_index(drop=True))
     last_nodes = last_nodes[last_nodes["flow_id"].isin(target_flows)]
-    for _, r in last_nodes.iterrows():
-        fid = int(r["flow_id"]); y = int(r["year"]); cid = int(r["cluster_id"])
+
+    def _task(rdict):
+        fid = int(rdict["flow_id"]); y = int(rdict["year"]); cid = int(rdict["cluster_id"])
         keywords = _load_top_terms_artifacts(artifacts, y, cid, topk=TOPK_KEYWORDS)
         docs_df = _load_cluster_docs_artifacts(artifacts, y, cid)
         titles  = _rep_titles_via_embeddings(docs_df, n=N_REP_TITLES) if not docs_df.empty else []
@@ -235,7 +266,7 @@ def _run_hybrid(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[st
         )
         try:
             out = _call_gpt(prompt, SYS_HYBRID)
-            rows_out.append({
+            return {
                 "flow_id": fid, "year": y, "cluster_id": cid,
                 "tech_name_ko": out.get("tech_name_ko",""),
                 "tech_name_en": out.get("tech_name_en",""),
@@ -245,18 +276,25 @@ def _run_hybrid(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[st
                 "rationale": out.get("rationale",""),
                 "raw_text": out.get("_raw_text",""),
                 "model": OPENAI_MODEL, "status": "ok"
-            })
+            }
         except Exception as e:
-            rows_out.append({"flow_id": fid, "year": y, "cluster_id": cid,
-                             "status": f"error: {type(e).__name__}: {e}"})
-        time.sleep(1.5)
+            return {"flow_id": fid, "year": y, "cluster_id": cid,
+                    "status": f"error: {type(e).__name__}: {e}"}
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(_task, r._asdict() if hasattr(r, "_asdict") else r)
+                   for _, r in last_nodes.iterrows()]
+        for res in _as_completed_results(futures):
+            rows_out.append(res)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows_out).to_csv(OUT_HYBRID, index=False, encoding="utf-8-sig")
     return OUT_HYBRID
 
 def _run_flowagg(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[str, Any]) -> Path:
     rows_out = []
-    for fid in target_flows:
+
+    def _task(fid: int):
         sub = panel[panel["flow_id"]==fid].sort_values("year")
         term_score: Dict[str,float] = {}
         for y, g in sub.groupby("year"):
@@ -268,12 +306,12 @@ def _run_flowagg(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[s
                     t = str(s["term"]).lower()
                     term_score[t] = term_score.get(t,0.0) + float(s["tfidf"])
         if not term_score:
-            rows_out.append({"flow_id": fid, "status":"no_terms"}); continue
+            return {"flow_id": fid, "status":"no_terms"}
         terms = sorted(term_score.items(), key=lambda x:x[1], reverse=True)[:60]
         prompt = f"[flow_id] {fid}\n[flow_keywords] {', '.join([t for t,_ in terms])}"
         try:
             out = _call_gpt(prompt, SYS_FLOWAG)
-            rows_out.append({
+            return {
                 "flow_id": fid,
                 "tech_name_ko": out.get("tech_name_ko",""),
                 "tech_name_en": out.get("tech_name_en",""),
@@ -283,10 +321,15 @@ def _run_flowagg(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[s
                 "rationale": out.get("rationale",""),
                 "raw_text": out.get("_raw_text",""),
                 "model": OPENAI_MODEL, "status": "ok"
-            })
+            }
         except Exception as e:
-            rows_out.append({"flow_id": fid, "status": f"error: {type(e).__name__}: {e}"})
-        time.sleep(1.5)
+            return {"flow_id": fid, "status": f"error: {type(e).__name__}: {e}"}
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(_task, int(fid)) for fid in target_flows]
+        for res in _as_completed_results(futures):
+            rows_out.append(res)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows_out).to_csv(OUT_FLOWAG, index=False, encoding="utf-8-sig")
     return OUT_FLOWAG
@@ -295,13 +338,25 @@ def _run_flowagg(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[s
 def run_tech_naming(_prompt_ignored: str | None = None, *,
                     artifacts: Optional[Dict[str, Any]] = None,
                     top_n: int = 10) -> Dict:
+    """
+    artifacts: run_clustering(...)[1]['artifacts'] 형태
+    top_n: 문서수 합 기준 상위 N개 flow 대상으로 실행
+
+    METHOD (env):
+      - "A": 하이브리드 + 플로우집계 모두 실행
+      - "H": 하이브리드만
+      - "F": 플로우집계만
+    """
     if artifacts is None or not isinstance(artifacts, dict):
         raise RuntimeError("artifacts 가 필요합니다. run_clustering(...)[1]['artifacts'] 를 전달하세요.")
+
     # 1) 패널 구성(artifacts의 flow_edges_df 사용)
     fedges = artifacts.get("flow_edges_df", pd.DataFrame())
     if fedges.empty:
         raise RuntimeError("artifacts.flow_edges_df 가 비었습니다.")
     panel = _panel_from_artifacts_edges(fedges)
+    if panel.empty:
+        raise RuntimeError("flow_edges_df 로부터 panel 생성에 실패했습니다(비어있음).")
     panel["year"] = panel["year"].astype(int)
 
     # 2) 문서수 합 기준 상위 N개 flow 선정
@@ -315,8 +370,28 @@ def run_tech_naming(_prompt_ignored: str | None = None, *,
 
     top_flows = _select_top_flows(panel, n=top_n)
 
-    # 3) 하이브리드 & 플로우집계 네이밍 실행 (최종 결과만 저장)
-    hybrid_path = _run_hybrid(panel, top_flows, artifacts)
-    flowag_path = _run_flowagg(panel, top_flows, artifacts)
+    # 3) 하이브리드/플로우집계 네이밍 실행 (최종 결과만 저장)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    return {"paths": {"hybrid_csv": str(hybrid_path), "flowagg_csv": str(flowag_path)}}
+    paths = {}
+    run_both = METHOD in ("", "A")
+    if run_both or METHOD == "H":
+        paths["hybrid_csv"] = str(_run_hybrid(panel, top_flows, artifacts))
+    if run_both or METHOD == "F":
+        paths["flowagg_csv"] = str(_run_flowagg(panel, top_flows, artifacts))
+
+    if not paths:
+        # METHOD 설정이 잘못되었을 때 안전장치
+        paths["hybrid_csv"] = str(_run_hybrid(panel, top_flows, artifacts))
+        paths["flowagg_csv"] = str(_run_flowagg(panel, top_flows, artifacts))
+
+    return {"paths": paths, "meta": {
+        "top_n": top_n,
+        "max_workers": MAX_WORKERS,
+        "request_timeout_s": REQUEST_TIMEOUT_S,
+        "retry": GPT_RETRY,
+        "backoff_base": BACKOFF_BASE,
+        "method": METHOD,
+        "label_suffix": LABEL_SUFFIX,
+        "model": OPENAI_MODEL,
+    }}
