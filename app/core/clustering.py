@@ -49,8 +49,9 @@ def _join_text(df: pd.DataFrame, cols: Iterable[str]) -> pd.Series:
     return df[list(cols)].fillna("").astype(str).agg(" ".join, axis=1)
 
 def _simple_tokenize(text: str) -> List[str]:
+    # 한글/영문 2글자 토큰까지 허용하여 정보 손실 최소화 (기존: len > 2)
     toks = _TOKEN_RE.findall((text or "").lower())
-    return [t for t in toks if len(t) > 2 and t not in _BASIC_STOPWORDS]
+    return [t for t in toks if len(t) >= 2 and t not in _BASIC_STOPWORDS]
 
 def _pick_text_cols(df: pd.DataFrame, user_cols: Iterable[str] | None) -> list[str]:
     # 사용자가 지정한 컬럼 중 존재하는 것
@@ -93,6 +94,14 @@ def _embedding_matrix(df_year: pd.DataFrame, embed_col: str) -> np.ndarray:
     X = np.vstack(arrs)
     return X
 
+def _write_empty_tfidf(tfidf_csv: Path, reason: str, meta: Dict[str, Any] | None = None) -> None:
+    # 디버깅에 유용하도록 원인/메타정보까지 남김
+    cols = ["cluster_id","term","tfidf","docs","error_reason","meta"]
+    df = pd.DataFrame(columns=cols)
+    df["error_reason"] = [reason]
+    df["meta"] = [meta or {}]
+    df.to_csv(tfidf_csv, index=False)
+
 # -----------------------------
 # ① 연도별 클러스터링
 # -----------------------------
@@ -108,8 +117,9 @@ def _cluster_one_year(
     반환: (라벨 달린 DF, counts_csv_path, tfidf_csv_path)
     - PCA/LSA 소표본 가드
     - k > n_docs 방지 (k_eff 적용)
-    - 텍스트 없거나 적을 때 TF-IDF 완화/폴백
+    - 텍스트 없거나 적을 때 TF-IDF 완화/폴백 + 재시도(백오프)
     """
+    df_year = df_year.reset_index(drop=True)
     _ensure_dir(year_dir)
 
     # 1) 임베딩 정규화 + 차원축소 (소표본 가드)
@@ -147,44 +157,78 @@ def _cluster_one_year(
 
     try:
         if not safe_text_cols:
-            pd.DataFrame(columns=["cluster_id","term","tfidf","docs"]).to_csv(tfidf_csv, index=False)
+            _write_empty_tfidf(tfidf_csv, "no_text_columns", {"picked_cols": [], "available_cols": list(df_year.columns)})
             return df_year, counts_csv, tfidf_csv
 
         text = _join_text(df_year, safe_text_cols)
         if text.str.len().fillna(0).sum() == 0:
-            pd.DataFrame(columns=["cluster_id","term","tfidf","docs"]).to_csv(tfidf_csv, index=False)
+            _write_empty_tfidf(tfidf_csv, "empty_text_after_join", {"picked_cols": safe_text_cols})
             return df_year, counts_csv, tfidf_csv
 
         # 소표본일수록 완화
         min_df_val = 1 if n_docs < 20 else 3
-        max_df_val = 1.0 if n_docs < 5 else 0.9
+        # 고중복/소표본 보호: max_df 완화
+        if n_docs <= 20:
+            max_df_val = 1.0
+        else:
+            max_df_val = 0.95  # 0.9 → 0.95로 완화
 
-        tf = TfidfVectorizer(
-            tokenizer=_simple_tokenize,
-            token_pattern=None,          # tokenizer 사용시 경고 제거
-            ngram_range=(1, 2),
-            min_df=min_df_val,
-            max_df=max_df_val,
-            max_features=120_000
-        )
-        Xtf = tf.fit_transform(text)
+        def _fit_tfidf(min_df_v: int | float, max_df_v: float) -> tuple[TfidfVectorizer, Any]:
+            tf = TfidfVectorizer(
+                tokenizer=_simple_tokenize,
+                token_pattern=None,          # tokenizer 사용시 경고 제거
+                ngram_range=(1, 2),
+                min_df=min_df_v,
+                max_df=max_df_v,
+                max_features=120_000
+            )
+            Xtf_local = tf.fit_transform(text)
+            return tf, Xtf_local
+
+        # 1차 시도
+        tf, Xtf = _fit_tfidf(min_df_val, max_df_val)
+
+        # 피처가 0이면 백오프 재시도: max_df=1.0, min_df=1
         if Xtf.shape[1] == 0:
-            pd.DataFrame(columns=["cluster_id","term","tfidf","docs"]).to_csv(tfidf_csv, index=False)
+            tf, Xtf = _fit_tfidf(1, 1.0)
+
+        if Xtf.shape[1] == 0:
+            _write_empty_tfidf(
+                tfidf_csv, "tfidf_no_features_after_backoff",
+                {"n_docs": n_docs, "min_df_try": [min_df_val, 1], "max_df_try": [max_df_val, 1.0], "picked_cols": safe_text_cols}
+            )
             return df_year, counts_csv, tfidf_csv
 
         vocab = np.array(tf.get_feature_names_out())
         rows: List[Dict[str, Any]] = []
-        for cid, g in df_year.groupby(label_col):
-            vec = np.asarray(Xtf[g.index].mean(axis=0)).ravel()
+
+        labels_arr = df_year[label_col].to_numpy()  # (n_docs,)
+        for cid in np.unique(labels_arr):
+            mask = (labels_arr == cid)  # (n_docs,) boolean
+            if not mask.any():
+                continue
+            # 클러스터 문서들의 TF-IDF 평균 벡터
+            vec = np.asarray(Xtf[mask].mean(axis=0)).ravel()
             if vec.size == 0:
                 continue
             top = vec.argsort()[::-1][:30]
             for t, sc in zip(vocab[top], vec[top]):
-                rows.append({"cluster_id": int(cid), "term": t, "tfidf": float(sc), "docs": int(len(g))})
+                rows.append({"cluster_id": int(cid), "term": t, "tfidf": float(sc), "docs": int(mask.sum())})
+
+        if not rows:
+            _write_empty_tfidf(
+                tfidf_csv, "no_rows_after_scoring",
+                {"n_docs": n_docs, "features": int(Xtf.shape[1]), "picked_cols": safe_text_cols}
+            )
+            return df_year, counts_csv, tfidf_csv
+
         pd.DataFrame(rows).to_csv(tfidf_csv, index=False)
-    except Exception:
-        # 어떤 이유든 실패하면 빈 구조라도 남김
-        pd.DataFrame(columns=["cluster_id","term","tfidf","docs","error"]).to_csv(tfidf_csv, index=False)
+
+    except Exception as e:
+        _write_empty_tfidf(
+            tfidf_csv, "exception",
+            {"message": str(e), "picked_cols": safe_text_cols, "n_docs": n_docs}
+        )
 
     return df_year, counts_csv, tfidf_csv
 
@@ -366,7 +410,8 @@ def run_clustering(
         for _, rr in tdf.iterrows():
             term = str(rr["term"])
             score = float(rr.get("tfidf", 0.0))
-            kw_counter[term] = kw_counter.get(term, 0.0) + score
+            if term:  # 빈 문자열 방지
+                kw_counter[term] = kw_counter.get(term, 0.0) + score
     keywords = [t for t, _ in sorted(kw_counter.items(), key=lambda x: x[1], reverse=True)[:100]]
 
     # 대표 타이틀: 연도×클러스터 샘플 1~2개

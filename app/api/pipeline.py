@@ -22,35 +22,35 @@ from app.core.utils_prompt import build_user_prompt
 
 router = APIRouter(tags=["Pipeline"])
 
-# --------- 저장 도우미(심플) ---------
-BASE_OUTPUT_DIR = Path(os.getenv("PIPELINE_OUTPUT_DIR", "runs"))
-
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-def _now_str() -> str:
-    return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-
-def _df_to_csv_safe(df: pd.DataFrame, path: Path) -> str:
-    """
-    CSV 저장 전 비스칼라(리스트/ndarray/딕트) 셀을 JSON 문자열로 변환.
-    """
-    def _ser(v):
-        if isinstance(v, (list, dict)):
-            return json.dumps(v, ensure_ascii=False)
-        if isinstance(v, (np.ndarray,)):
-            return json.dumps(v.tolist(), ensure_ascii=False)
-        return v
-    df_out = df.copy()
-    for col in df_out.columns:
-        if df_out[col].dtype == "object":
-            df_out[col] = df_out[col].map(_ser)
-    df_out.to_csv(path, index=False)
-    return str(path)
-
-def _save_json(path: Path, obj: Any) -> str:
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-    return str(path)
+# # --------- 저장 도우미(심플) ---------
+# BASE_OUTPUT_DIR = Path(os.getenv("PIPELINE_OUTPUT_DIR", "runs"))
+#
+# def _ensure_dir(p: Path) -> None:
+#     p.mkdir(parents=True, exist_ok=True)
+#
+# def _now_str() -> str:
+#     return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+#
+# def _df_to_csv_safe(df: pd.DataFrame, path: Path) -> str:
+#     """
+#     CSV 저장 전 비스칼라(리스트/ndarray/딕트) 셀을 JSON 문자열로 변환.
+#     """
+#     def _ser(v):
+#         if isinstance(v, (list, dict)):
+#             return json.dumps(v, ensure_ascii=False)
+#         if isinstance(v, (np.ndarray,)):
+#             return json.dumps(v.tolist(), ensure_ascii=False)
+#         return v
+#     df_out = df.copy()
+#     for col in df_out.columns:
+#         if df_out[col].dtype == "object":
+#             df_out[col] = df_out[col].map(_ser)
+#     df_out.to_csv(path, index=False)
+#     return str(path)
+#
+# def _save_json(path: Path, obj: Any) -> str:
+#     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+#     return str(path)
 
 # --------- 업로드 파일 → DataFrame 로더 (원본 그대로) ---------
 def _load_table_from_upload(
@@ -189,54 +189,43 @@ async def run_pipeline(
     filename = file.filename
     content_type = file.content_type
 
-    run_id = run_id or f"{_now_str()}-{uuid.uuid4().hex[:8]}"
-    outdir = BASE_OUTPUT_DIR / run_id
-    _ensure_dir(outdir)
+    # run_id = run_id or f"{_now_str()}-{uuid.uuid4().hex[:8]}"
+    # outdir = BASE_OUTPUT_DIR / run_id
+    # _ensure_dir(outdir)
 
     async def stream():
         try:
             # 0) 파일 로드
-            yield json.dumps({"step": "파일 로드 중", "progress": 0, "run_id": run_id}) + "\n"
+            yield json.dumps({"step": "파일 로드 중", "progress": 0}) + "\n"
             df, meta = await asyncio.to_thread(_load_table_from_upload, file_bytes, filename, content_type, True)
             yield json.dumps({"step": "파일 로드 완료", "progress": 5, "meta": {"filename": filename, "content_type": content_type, **meta}}) + "\n"
 
             # 1) 전처리
             yield json.dumps({"step": "데이터 전처리 시작", "progress": 10}) + "\n"
             df_clean = await asyncio.to_thread(run_preprocess, df, int(cutoff_year))
-            path_pre = _df_to_csv_safe(df_clean, outdir / "01_preprocessed.csv")
-            yield json.dumps({"step": "데이터 전처리 완료", "progress": 25, "path": path_pre}) + "\n"
 
             # 2) 필터링(< cutoff_year 동일 규칙)
             df_filtered = await asyncio.to_thread(filter_df_before_year, df_clean, int(cutoff_year))
-            path_fil = _df_to_csv_safe(df_filtered, outdir / "02_filtered.csv")
-            yield json.dumps({"step": "필터링 완료", "progress": 35, "path": path_fil}) + "\n"
 
             # 3) 임베딩
-            yield json.dumps({"step": "임베딩 생성 중", "progress": 45}) + "\n"
             df_embed = await asyncio.to_thread(run_embedding, df_filtered, model_name)
-            if not isinstance(df_embed, pd.DataFrame):
-                raise TypeError(f"run_embedding must return a DataFrame, got {type(df_embed)}")
-            path_emb = _df_to_csv_safe(df_embed, outdir / "03_embedding.csv")
-            yield json.dumps({"step": "임베딩 완료", "progress": 65, "path": path_emb}) + "\n"
 
             # 4) 클러스터링/요약
-            yield json.dumps({"step": "클러스터링 및 요약 중", "progress": 75}) + "\n"
+            yield json.dumps({"step": "클러스터링 및 추세 분석 중", "progress": 70}) + "\n"
             df_clustered, summary = await asyncio.to_thread(run_clustering, df_embed, n_clusters)
-            path_clus = _df_to_csv_safe(df_clustered, outdir / "04_clustered.csv")
-            path_sum = _save_json(outdir / "04_summary.json", summary if isinstance(summary, dict) else {"summary_type": str(type(summary))})
-            yield json.dumps({"step": "클러스터링 완료", "progress": 88, "paths": {"clustered": path_clus, "summary": path_sum}}) + "\n"
 
             # 5) 네이밍
-            yield json.dumps({"step": "기술명 생성 중", "progress": 92}) + "\n"
+            yield json.dumps({"step": "기술명 생성 중", "progress": 90}) + "\n"
             if isinstance(summary, dict):
                 kw_raw = summary.get("keywords", [])
                 tt_raw = summary.get("titles", [])
             else:
+                # dict가 아닌 경우(Series/DataFrame/Namespace 등) 속성으로 접근
                 kw_raw = getattr(summary, "keywords", [])
                 tt_raw = getattr(summary, "titles", [])
 
             keywords = _to_str_list(kw_raw)
-            titles   = _to_str_list(tt_raw)
+            titles = _to_str_list(tt_raw)
 
             year_val = 2024
             if isinstance(df_clustered, pd.DataFrame) and "year" in df_clustered.columns:
@@ -253,8 +242,14 @@ async def run_pipeline(
                 rep_titles=titles
             )
             naming_result = await asyncio.to_thread(run_tech_naming, prompt)
-            path_name = _save_json(outdir / "05_naming.json", naming_result)
-            yield json.dumps({"step": "네이밍 완료", "progress": 100, "path": path_name}) + "\n"
+
+            # 완료
+            yield json.dumps({
+                "step": "완료",
+                "progress": 100,
+                "result": {"summary": summary if isinstance(summary, dict) else str(type(summary)),
+                           "naming": naming_result}
+            }) + "\n"
 
         except Exception as e:
             yield json.dumps({"step": "오류 발생", "progress": -1, "error": str(e)}) + "\n"
