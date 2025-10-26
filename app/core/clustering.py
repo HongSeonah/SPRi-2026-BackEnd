@@ -24,7 +24,7 @@ DEFAULT_EMBED_COL = "embedding"
 DEFAULT_TEXT_COLS: Tuple[str, ...] = ("title",)  # 없으면 자동탐색
 DEFAULT_K = 100
 
-ROOT = Path("cluster_out").resolve()  # 절대경로
+ROOT = Path("cluster_out").resolve()  # 절대경로 (경로 정보는 summary에 참고용으로만 제공)
 
 # 간단 스톱워드 (NLTK 의존 제거)
 _BASIC_STOPWORDS = {
@@ -49,7 +49,7 @@ def _join_text(df: pd.DataFrame, cols: Iterable[str]) -> pd.Series:
     return df[list(cols)].fillna("").astype(str).agg(" ".join, axis=1)
 
 def _simple_tokenize(text: str) -> List[str]:
-    # 한글/영문 2글자 토큰까지 허용하여 정보 손실 최소화 (기존: len > 2)
+    # 한글/영문 2글자 토큰까지 허용하여 정보 손실 최소화
     toks = _TOKEN_RE.findall((text or "").lower())
     return [t for t in toks if len(t) >= 2 and t not in _BASIC_STOPWORDS]
 
@@ -94,33 +94,29 @@ def _embedding_matrix(df_year: pd.DataFrame, embed_col: str) -> np.ndarray:
     X = np.vstack(arrs)
     return X
 
-def _write_empty_tfidf(tfidf_csv: Path, reason: str, meta: Dict[str, Any] | None = None) -> None:
-    # 디버깅에 유용하도록 원인/메타정보까지 남김
-    cols = ["cluster_id","term","tfidf","docs","error_reason","meta"]
-    df = pd.DataFrame(columns=cols)
-    df["error_reason"] = [reason]
-    df["meta"] = [meta or {}]
-    df.to_csv(tfidf_csv, index=False)
+def _empty_tfidf_df(reason: str, meta: Dict[str, Any] | None = None) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "cluster_id": np.nan, "term": "", "tfidf": 0.0, "docs": 0,
+        "error_reason": reason, "meta": meta or {}
+    }])
 
 # -----------------------------
-# ① 연도별 클러스터링
+# ① 연도별 클러스터링 (메모리 전용)
 # -----------------------------
 def _cluster_one_year(
     df_year: pd.DataFrame,
     year: int,
     k: int,
-    year_dir: Path,
     embed_col: str,
     text_cols: Iterable[str] | None
-) -> Tuple[pd.DataFrame, Path, Path]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    반환: (라벨 달린 DF, counts_csv_path, tfidf_csv_path)
+    반환: (라벨 달린 DF, counts_df, tfidf_df)
     - PCA/LSA 소표본 가드
     - k > n_docs 방지 (k_eff 적용)
     - 텍스트 없거나 적을 때 TF-IDF 완화/폴백 + 재시도(백오프)
     """
     df_year = df_year.reset_index(drop=True)
-    _ensure_dir(year_dir)
 
     # 1) 임베딩 정규화 + 차원축소 (소표본 가드)
     X = _embedding_matrix(df_year, embed_col)
@@ -140,38 +136,29 @@ def _cluster_one_year(
     label_col = f"cluster_k{k}"      # 열 이름은 원래 k 유지(유니크 라벨 수는 k_eff)
     df_year[label_col] = labels
 
-    # 3) 저장 ① clustered
-    out_csv = year_dir / f"{year}_clustered_k{k}.csv"
-    df_year.to_csv(out_csv, index=False)
-
-    # 4) 저장 ② counts
+    # 3) counts (메모리)
     counts = df_year[label_col].value_counts().sort_index()
     counts_df = counts.rename_axis("cluster_id").reset_index(name="count")
     counts_df["ratio"] = counts_df["count"] / counts_df["count"].sum()
-    counts_csv = year_dir / f"cluster_counts_k{k}.csv"
-    counts_df.to_csv(counts_csv, index=False)
 
-    # 5) 저장 ③ tf-idf (텍스트 컬럼 자동 선택 + 소표본 완화)
+    # 4) tf-idf (텍스트 컬럼 자동 선택 + 소표본 완화)
     safe_text_cols = _pick_text_cols(df_year, text_cols)
-    tfidf_csv = year_dir / f"tfidf_top_terms_k{k}.csv"
 
     try:
         if not safe_text_cols:
-            _write_empty_tfidf(tfidf_csv, "no_text_columns", {"picked_cols": [], "available_cols": list(df_year.columns)})
-            return df_year, counts_csv, tfidf_csv
+            tfidf_df = _empty_tfidf_df("no_text_columns",
+                                       {"picked_cols": [], "available_cols": list(df_year.columns)})
+            return df_year, counts_df, tfidf_df
 
         text = _join_text(df_year, safe_text_cols)
         if text.str.len().fillna(0).sum() == 0:
-            _write_empty_tfidf(tfidf_csv, "empty_text_after_join", {"picked_cols": safe_text_cols})
-            return df_year, counts_csv, tfidf_csv
+            tfidf_df = _empty_tfidf_df("empty_text_after_join", {"picked_cols": safe_text_cols})
+            return df_year, counts_df, tfidf_df
 
         # 소표본일수록 완화
         min_df_val = 1 if n_docs < 20 else 3
         # 고중복/소표본 보호: max_df 완화
-        if n_docs <= 20:
-            max_df_val = 1.0
-        else:
-            max_df_val = 0.95  # 0.9 → 0.95로 완화
+        max_df_val = 1.0 if n_docs <= 20 else 0.95
 
         def _fit_tfidf(min_df_v: int | float, max_df_v: float) -> tuple[TfidfVectorizer, Any]:
             tf = TfidfVectorizer(
@@ -193,11 +180,11 @@ def _cluster_one_year(
             tf, Xtf = _fit_tfidf(1, 1.0)
 
         if Xtf.shape[1] == 0:
-            _write_empty_tfidf(
-                tfidf_csv, "tfidf_no_features_after_backoff",
+            tfidf_df = _empty_tfidf_df(
+                "tfidf_no_features_after_backoff",
                 {"n_docs": n_docs, "min_df_try": [min_df_val, 1], "max_df_try": [max_df_val, 1.0], "picked_cols": safe_text_cols}
             )
-            return df_year, counts_csv, tfidf_csv
+            return df_year, counts_df, tfidf_df
 
         vocab = np.array(tf.get_feature_names_out())
         rows: List[Dict[str, Any]] = []
@@ -216,24 +203,24 @@ def _cluster_one_year(
                 rows.append({"cluster_id": int(cid), "term": t, "tfidf": float(sc), "docs": int(mask.sum())})
 
         if not rows:
-            _write_empty_tfidf(
-                tfidf_csv, "no_rows_after_scoring",
+            tfidf_df = _empty_tfidf_df(
+                "no_rows_after_scoring",
                 {"n_docs": n_docs, "features": int(Xtf.shape[1]), "picked_cols": safe_text_cols}
             )
-            return df_year, counts_csv, tfidf_csv
+            return df_year, counts_df, tfidf_df
 
-        pd.DataFrame(rows).to_csv(tfidf_csv, index=False)
+        tfidf_df = pd.DataFrame(rows)
 
     except Exception as e:
-        _write_empty_tfidf(
-            tfidf_csv, "exception",
+        tfidf_df = _empty_tfidf_df(
+            "exception",
             {"message": str(e), "picked_cols": safe_text_cols, "n_docs": n_docs}
         )
 
-    return df_year, counts_csv, tfidf_csv
+    return df_year, counts_df, tfidf_df
 
 # -----------------------------
-# ② 전이 매칭 (연속 연도 간)
+# ② 전이 매칭 (연속 연도 간, 메모리 전용)
 # -----------------------------
 def _build_joint_lsa(text_prev: pd.Series, text_next: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
     vec = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), min_df=1, max_df=0.95,
@@ -265,16 +252,11 @@ def _centroids(Z: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarra
 
 def _match_years(
     y1: int, y2: int, k: int,
-    yearly_dir: Path,
-    compare_dir: Path,
+    df1: pd.DataFrame, df2: pd.DataFrame,
     text_cols: Iterable[str],
     label_col: str,
     thr: float = 0.08
-) -> Path:
-    f1 = yearly_dir / str(y1) / f"{y1}_clustered_k{k}.csv"
-    f2 = yearly_dir / str(y2) / f"{y2}_clustered_k{k}.csv"
-    df1, df2 = pd.read_csv(f1), pd.read_csv(f2)
-
+) -> pd.DataFrame:
     # 텍스트 결합(연도 파일의 실제 컬럼 기준으로 유연하게)
     cols1 = _pick_text_cols(df1, text_cols)
     cols2 = _pick_text_cols(df2, text_cols)
@@ -296,23 +278,10 @@ def _match_years(
         "similarity": np.where(matched, sims, np.nan),
         "matched": matched
     })
+    return edges
 
-    out_dir = compare_dir / f"{y1}*to*{y2}"
-    _ensure_dir(out_dir)
-    out_csv = out_dir / "A_links.csv"
-    edges.to_csv(out_csv, index=False)
-    return out_csv
-
-# -----------------------------
-# ③ Flow Year Metrics
-# -----------------------------
-def _safe_div(a, b):
-    return np.nan if b == 0 else (a / b)
-
-def _load_counts(year_dir: Path, y: int, k: int) -> pd.DataFrame:
-    p = year_dir / str(y) / f"cluster_counts_k{k}.csv"
-    df = pd.read_csv(p).rename(columns={"cluster_id": "cid"})
-    return df
+def _counts_df_to_cid(counts_df: pd.DataFrame) -> pd.DataFrame:
+    return counts_df.rename(columns={"cluster_id": "cid"})
 
 # -----------------------------
 # Public API
@@ -329,60 +298,62 @@ def run_clustering(
     """
     반환: (df_clustered_all, summary_dict)
     - df_clustered_all: 각 연도별 라벨이 추가된 전체 DF
-    - summary_dict: {"keywords":[...], "titles":[...], "paths": {...}}
+    - summary_dict: {"keywords":[...], "titles":[...], "paths": {...}, "artifacts": {...}}
     """
+    # 디스크 경로는 참고 정보만 제공(실제 파일 저장 X)
     output_root = Path(output_root).resolve()
     yearly_dir = output_root / "yearly_v4"
     compare_dir = output_root / f"compare_methods_k{n_clusters}"
-    _ensure_dir(yearly_dir)
-    _ensure_dir(compare_dir)
 
     label_col = f"cluster_k{n_clusters}"
 
-    # ---- 1) 연도별 클러스터링 ----
+    # ---- 1) 연도별 클러스터링 (메모리) ----
     years = sorted(pd.to_numeric(df_embed[year_col], errors="coerce").dropna().astype(int).unique().tolist())
     clustered_parts: List[pd.DataFrame] = []
-    tfidf_paths: List[Path] = []
+    counts_by_year: Dict[int, pd.DataFrame] = {}
+    tfidf_by_year: Dict[int, pd.DataFrame] = {}
 
     for y in years:
-        y_dir = yearly_dir / str(y)
         df_y = df_embed[df_embed[year_col] == y].copy()
         if df_y.empty:
             continue
-        df_y_labeled, counts_csv, tfidf_csv = _cluster_one_year(
-            df_y, y, n_clusters, y_dir, embed_col, text_cols
+        df_y_labeled, counts_df, tfidf_df = _cluster_one_year(
+            df_y, y, n_clusters, embed_col, text_cols
         )
         clustered_parts.append(df_y_labeled)
-        tfidf_paths.append(tfidf_csv)
+        counts_by_year[int(y)] = counts_df
+        tfidf_by_year[int(y)] = tfidf_df
 
     if not clustered_parts:
-        return df_embed.copy(), {"keywords": [], "titles": [], "paths": {}}
+        return df_embed.copy(), {"keywords": [], "titles": [], "paths": {}, "artifacts": {}}
 
     df_all_clustered = pd.concat(clustered_parts, ignore_index=True)
 
-    # ---- 2) 전이 매칭 ----
-    link_paths: List[Path] = []
+    # ---- 2) 전이 매칭 (메모리) ----
+    edges_all: List[pd.DataFrame] = []
     for i in range(len(years) - 1):
-        p = _match_years(
+        edges = _match_years(
             years[i], years[i + 1], n_clusters,
-            yearly_dir, compare_dir, text_cols or (),
+            df_all_clustered[df_all_clustered[year_col] == years[i]],
+            df_all_clustered[df_all_clustered[year_col] == years[i + 1]],
+            text_cols or (),
             label_col,
             thr=match_threshold
         )
-        link_paths.append(p)
+        edges_all.append(edges)
 
-    # ---- 3) Flow Year Metrics ----
+    # ---- 3) Flow Year Metrics (메모리) ----
     rows = []
     for i in range(len(years) - 1):
         y1, y2 = years[i], years[i + 1]
-        links = pd.read_csv(compare_dir / f"{y1}*to*{y2}/A_links.csv")
-        c1 = _load_counts(yearly_dir, y1, n_clusters)
-        c2 = _load_counts(yearly_dir, y2, n_clusters)
+        links = edges_all[i]
+        c1 = _counts_df_to_cid(counts_by_year[y1])
+        c2 = _counts_df_to_cid(counts_by_year[y2])
         links_m = links[links["matched"] == True]  # noqa: E712
         for _, r in links_m.iterrows():
             d1 = int(c1.loc[c1["cid"] == r["prev_id"], "count"].values[0])
             d2 = int(c2.loc[c2["cid"] == r["next_id"], "count"].values[0])
-            yoy = _safe_div(d2 - d1, d1)
+            yoy = np.nan if d1 == 0 else (d2 - d1) / d1
             rows.append({
                 "year_from": y1, "year_to": y2,
                 "prev_id": int(r["prev_id"]), "next_id": int(r["next_id"]),
@@ -391,20 +362,10 @@ def run_clustering(
             })
     flow_df = pd.DataFrame(rows)
 
-    # 저장: 네이밍 호환을 위해 두 파일명 모두 생성
-    flow_out = compare_dir / f"flow_year_metrics_A_k{n_clusters}.csv"
-    flow_df.to_csv(flow_out, index=False)
-    flow_out_overall = compare_dir / f"flow_year_overall_A_k{n_clusters}.csv"
-    flow_df.to_csv(flow_out_overall, index=False)
-
     # ---- summary 산출 ----
     # 키워드: 모든 연도 TF-IDF 상위 용어 점수 합 상위 100개
     kw_counter: Dict[str, float] = {}
-    for p in tfidf_paths:
-        try:
-            tdf = pd.read_csv(p)
-        except Exception:
-            continue
+    for tdf in tfidf_by_year.values():
         if not {"term","tfidf"} <= set(tdf.columns):
             continue
         for _, rr in tdf.iterrows():
@@ -428,12 +389,15 @@ def run_clustering(
     summary = {
         "keywords": keywords,
         "titles": titles[:120],
-        "paths": {
-            "yearly_dir": str(yearly_dir),
-            "compare_dir": str(compare_dir),
-            "flow_metrics": str(flow_out),
-            "flow_overall": str(flow_out_overall),
+        "paths": {"yearly_dir": str(yearly_dir), "compare_dir": str(compare_dir), "label_col": label_col},
+        "artifacts": {
+            "years": years,
             "label_col": label_col,
+            "clustered_by_year": {int(y): df_all_clustered[df_all_clustered[year_col] == y].copy() for y in years},
+            "counts_by_year": counts_by_year,
+            "tfidf_by_year": tfidf_by_year,
+            "edges": edges_all,
+            "flow_edges_df": flow_df.copy()
         }
     }
 

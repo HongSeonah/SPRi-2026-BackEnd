@@ -1,8 +1,8 @@
 # app/core/tech_naming.py
 # ============================================================
 #  기술 네이밍 생성기 (Hybrid + Flow-Aggregated)
-#  - flow_id가 없는 패널(전이 엣지 표)도 자동으로 flow 재구성
-#  - 상위 N개(문서수 기준) flow만 네이밍
+#  - 중간 산출물은 artifacts로 주입받아 메모리에서 사용
+#  - 최종 네이밍 CSV만 OUTPUT_DIR에 저장
 # ============================================================
 
 from __future__ import annotations
@@ -13,16 +13,12 @@ import numpy as np
 import pandas as pd
 
 # ---------------- Env / Paths ----------------
-LABEL_SUFFIX = os.getenv("LABEL_SUFFIX", "k100")   # k5, k50, k100 ...
+# 최종 저장 경로만 사용 (쿠버/로컬 모두 OUTPUT_DIR로 제어)
+OUTPUT_DIR   = Path(os.getenv("OUTPUT_DIR", "/var/lib/app/outputs")).resolve()
+LABEL_SUFFIX = os.getenv("LABEL_SUFFIX", "k100")   # 메타 표기용
 METHOD       = os.getenv("METHOD", "A")
-ROOT         = Path(f"./cluster_out/compare_methods_{LABEL_SUFFIX}").resolve()
-YEARLY_DIRS  = [Path("./cluster_out/yearly_v4").resolve(),
-                Path("./cluster_out/yearly_v3").resolve(),
-                Path("./cluster_out/yearly_v2").resolve()]
-
-PANEL_EDGES  = ROOT / f"flow_year_overall_{METHOD}_{LABEL_SUFFIX}.csv"
-OUT_HYBRID   = ROOT / "grading_v3/model_weak_upgrade/names_generated_hybrid.csv"
-OUT_FLOWAG   = ROOT / "grading_v3/model_weak_upgrade/names_generated_flowagg.csv"
+OUT_HYBRID   = OUTPUT_DIR / "names_generated_hybrid.csv"
+OUT_FLOWAG   = OUTPUT_DIR / "names_generated_flowagg.csv"
 
 # ---------------- OpenAI ----------------
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -117,37 +113,6 @@ def _call_gpt(user_prompt: str, sys_prompt: str, retry=5, sleep=2.0) -> Dict:
             time.sleep(sleep*(i+1))
     raise last_err
 
-# ---------------- 파일 탐색 유틸 ----------------
-def _find_tfidf_file(year: int) -> Optional[Path]:
-    for base in YEARLY_DIRS:
-        f = base/str(year)/f"tfidf_top_terms_{LABEL_SUFFIX}.csv"
-        if f.exists(): return f
-    for base in YEARLY_DIRS:
-        hits = sorted((base/str(year)).glob("tfidf_top_terms_k*.csv"))
-        if hits: return hits[0]
-    return None
-
-def _find_counts_file(year: int) -> Optional[Path]:
-    for base in YEARLY_DIRS:
-        f = base/str(year)/f"cluster_counts_{LABEL_SUFFIX}.csv"
-        if f.exists(): return f
-    for base in YEARLY_DIRS:
-        hits = sorted((base/str(year)).glob("cluster_counts_k*.csv"))
-        if hits: return hits[0]
-    return None
-
-def _find_year_clustered_file(year: int) -> Optional[Tuple[Path,str]]:
-    for base in YEARLY_DIRS:
-        ydir = base/str(year)
-        if not ydir.exists(): continue
-        for f in sorted(ydir.glob("*clustered_k*.csv")):
-            try:
-                dfh = pd.read_csv(f, nrows=2)
-                lab = next((c for c in dfh.columns if re.fullmatch(r"cluster_k\d+", c)), None)
-                if lab: return f, lab
-            except: pass
-    return None
-
 # ---------------- 패널 재구성 ----------------
 def _build_panel_from_edges(df_edges: pd.DataFrame) -> pd.DataFrame:
     need = {"year_from","year_to","prev_id","next_id"}
@@ -184,45 +149,10 @@ def _build_panel_from_edges(df_edges: pd.DataFrame) -> pd.DataFrame:
     panel = pd.DataFrame(rows)
     if panel.empty: return panel
     panel["docs"] = panel.apply(lambda r: docs_map.get((int(r["year"]), int(r["cluster_id"])), np.nan), axis=1)
-    missing = panel[panel["docs"].isna()]
-    if not missing.empty:
-        cache_counts: Dict[int, pd.DataFrame] = {}
-        for y in sorted(panel["year"].unique()):
-            f = _find_counts_file(int(y))
-            if f and f.exists():
-                dfc = pd.read_csv(f)
-                if {"cluster_id","count"}.issubset(dfc.columns):
-                    cache_counts[int(y)] = dfc[["cluster_id","count"]].rename(columns={"count":"docs"})
-        def _fill_doc(row):
-            if not pd.isna(row["docs"]): return row["docs"]
-            y = int(row["year"]); cid = int(row["cluster_id"])
-            dfc = cache_counts.get(y)
-            if dfc is None: return np.nan
-            hit = dfc[dfc["cluster_id"]==cid]
-            return int(hit["docs"].values[0]) if not hit.empty else np.nan
-        panel["docs"] = panel.apply(_fill_doc, axis=1)
     return panel
 
-def _load_panel_or_build_flows() -> pd.DataFrame:
-    if not PANEL_EDGES.exists():
-        raise FileNotFoundError(f"패널/엣지 파일이 없습니다: {PANEL_EDGES}")
-    df = pd.read_csv(PANEL_EDGES)
-    if "flow_id" in df.columns and {"year","cluster_id"}.issubset(df.columns):
-        return df[["flow_id","year","cluster_id"] + ([c for c in ["docs"] if c in df.columns])].copy()
-    panel = _build_panel_from_edges(df)
-    if panel.empty:
-        raise RuntimeError("엣지 표로부터 flow 패널을 구성하지 못했습니다 (빈 결과).")
-    return panel
-
-# ---------------- 상위 Flow 선정 ----------------
-MAX_FLOWS_FOR_TEST = 100
-def _select_top_flows(panel: pd.DataFrame, top_n:int=MAX_FLOWS_FOR_TEST) -> List[int]:
-    if "docs" not in panel.columns:
-        panel["docs"] = 1
-    agg = (panel.groupby("flow_id", as_index=False)["docs"].sum()
-           .sort_values("docs", ascending=False)
-           .head(top_n))
-    return agg["flow_id"].astype(int).tolist()
+def _panel_from_artifacts_edges(flow_edges_df: pd.DataFrame) -> pd.DataFrame:
+    return _build_panel_from_edges(flow_edges_df)
 
 # ---------------- 텍스트/키워드 로딩 ----------------
 TITLE_COLS_CAND = ["title","paper_title","doc_title"]
@@ -244,22 +174,6 @@ def _parse_embedding(x):
                 return np.asarray(ast.literal_eval(x),dtype=np.float32)
             except: return None
     return None
-
-def _load_cluster_docs(year:int, cluster_id:int) -> pd.DataFrame:
-    found = _find_year_clustered_file(year)
-    if not found: return pd.DataFrame()
-    f, lab = found
-    df = pd.read_csv(f)
-    if lab not in df.columns: return pd.DataFrame()
-    return df[df[lab]==cluster_id].copy()
-
-def _load_top_terms(year:int, cluster_id:int, topk:int=40) -> List[str]:
-    f = _find_tfidf_file(year)
-    if not f: return []
-    df = pd.read_csv(f)
-    if not {"cluster_id","term","tfidf"}.issubset(df.columns): return []
-    sub = df[df["cluster_id"]==cluster_id].sort_values("tfidf",ascending=False).head(topk)
-    return sub["term"].astype(str).tolist()
 
 def _rep_titles_via_embeddings(df_c: pd.DataFrame, n:int=3) -> List[str]:
     emb_col = next((c for c in df_c.columns if c.lower()=="embedding"), None)
@@ -292,14 +206,27 @@ SYS_FLOWAG = (
     '{"tech_name_ko":"","tech_name_en":"","purpose":"","method":"","novelty":"","rationale":""}'
 )
 
-def _run_hybrid(panel: pd.DataFrame, target_flows: List[int]) -> Path:
+def _load_cluster_docs_artifacts(artifacts: Dict[str, Any], year:int, cluster_id:int) -> pd.DataFrame:
+    label_col = artifacts["label_col"]
+    df = artifacts["clustered_by_year"].get(int(year), pd.DataFrame())
+    if df.empty or label_col not in df.columns:
+        return pd.DataFrame()
+    return df[df[label_col] == int(cluster_id)].copy()
+
+def _load_top_terms_artifacts(artifacts: Dict[str, Any], year:int, cluster_id:int, topk:int=40) -> List[str]:
+    df = artifacts["tfidf_by_year"].get(int(year), pd.DataFrame())
+    if df.empty or not {"cluster_id","term","tfidf"} <= set(df.columns): return []
+    sub = df[df["cluster_id"]==int(cluster_id)].sort_values("tfidf", ascending=False).head(topk)
+    return sub["term"].astype(str).tolist()
+
+def _run_hybrid(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[str, Any]) -> Path:
     rows_out = []
     last_nodes = (panel.sort_values("year").groupby("flow_id").tail(1).reset_index(drop=True))
     last_nodes = last_nodes[last_nodes["flow_id"].isin(target_flows)]
     for _, r in last_nodes.iterrows():
         fid = int(r["flow_id"]); y = int(r["year"]); cid = int(r["cluster_id"])
-        keywords = _load_top_terms(y, cid, topk=TOPK_KEYWORDS)
-        docs_df = _load_cluster_docs(y, cid)
+        keywords = _load_top_terms_artifacts(artifacts, y, cid, topk=TOPK_KEYWORDS)
+        docs_df = _load_cluster_docs_artifacts(artifacts, y, cid)
         titles  = _rep_titles_via_embeddings(docs_df, n=N_REP_TITLES) if not docs_df.empty else []
         prompt = (
             f"[flow_id] {fid}\n[year] {y}\n"
@@ -323,19 +250,18 @@ def _run_hybrid(panel: pd.DataFrame, target_flows: List[int]) -> Path:
             rows_out.append({"flow_id": fid, "year": y, "cluster_id": cid,
                              "status": f"error: {type(e).__name__}: {e}"})
         time.sleep(1.5)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows_out).to_csv(OUT_HYBRID, index=False, encoding="utf-8-sig")
     return OUT_HYBRID
 
-def _run_flowagg(panel: pd.DataFrame, target_flows: List[int]) -> Path:
+def _run_flowagg(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[str, Any]) -> Path:
     rows_out = []
     for fid in target_flows:
         sub = panel[panel["flow_id"]==fid].sort_values("year")
         term_score: Dict[str,float] = {}
         for y, g in sub.groupby("year"):
-            f = _find_tfidf_file(int(y))
-            if not f: continue
-            df = pd.read_csv(f)
-            if not {"cluster_id","term","tfidf"}.issubset(df.columns): continue
+            df = artifacts["tfidf_by_year"].get(int(y), pd.DataFrame())
+            if df.empty or not {"cluster_id","term","tfidf"} <= set(df.columns): continue
             for cid in g["cluster_id"].astype(int).tolist():
                 top = df[df["cluster_id"]==cid].sort_values("tfidf",ascending=False).head(80)
                 for _, s in top.iterrows():
@@ -361,22 +287,36 @@ def _run_flowagg(panel: pd.DataFrame, target_flows: List[int]) -> Path:
         except Exception as e:
             rows_out.append({"flow_id": fid, "status": f"error: {type(e).__name__}: {e}"})
         time.sleep(1.5)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows_out).to_csv(OUT_FLOWAG, index=False, encoding="utf-8-sig")
     return OUT_FLOWAG
 
 # ---------------- 진입점 ----------------
-def run_tech_naming(_prompt_ignored: str | None = None) -> Dict:
-    # 1) 패널 로드(또는 엣지→패널 변환)
-    panel = _load_panel_or_build_flows()
+def run_tech_naming(_prompt_ignored: str | None = None, *,
+                    artifacts: Optional[Dict[str, Any]] = None,
+                    top_n: int = 100) -> Dict:
+    if artifacts is None or not isinstance(artifacts, dict):
+        raise RuntimeError("artifacts 가 필요합니다. run_clustering(...)[1]['artifacts'] 를 전달하세요.")
+    # 1) 패널 구성(artifacts의 flow_edges_df 사용)
+    fedges = artifacts.get("flow_edges_df", pd.DataFrame())
+    if fedges.empty:
+        raise RuntimeError("artifacts.flow_edges_df 가 비었습니다.")
+    panel = _panel_from_artifacts_edges(fedges)
     panel["year"] = panel["year"].astype(int)
 
     # 2) 문서수 합 기준 상위 N개 flow 선정
-    top_flows = _select_top_flows(panel, top_n=10)
+    def _select_top_flows(panel_df: pd.DataFrame, n: int) -> List[int]:
+        if "docs" not in panel_df.columns:
+            panel_df["docs"] = 1
+        agg = (panel_df.groupby("flow_id", as_index=False)["docs"].sum()
+               .sort_values("docs", ascending=False)
+               .head(n))
+        return agg["flow_id"].astype(int).tolist()
 
-    # 3) 하이브리드 & 플로우집계 네이밍 실행
-    OUT_HYBRID.parent.mkdir(parents=True, exist_ok=True)
-    OUT_FLOWAG.parent.mkdir(parents=True, exist_ok=True)
-    hybrid_path = _run_hybrid(panel, top_flows)
-    flowag_path = _run_flowagg(panel, top_flows)
+    top_flows = _select_top_flows(panel, n=top_n)
+
+    # 3) 하이브리드 & 플로우집계 네이밍 실행 (최종 결과만 저장)
+    hybrid_path = _run_hybrid(panel, top_flows, artifacts)
+    flowag_path = _run_flowagg(panel, top_flows, artifacts)
 
     return {"paths": {"hybrid_csv": str(hybrid_path), "flowagg_csv": str(flowag_path)}}

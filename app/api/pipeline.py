@@ -18,39 +18,8 @@ from app.core.preprocess import run_preprocess, filter_df_before_year
 from app.core.embedding import run_embedding
 from app.core.clustering import run_clustering
 from app.core.tech_naming import run_tech_naming
-from app.core.utils_prompt import build_user_prompt
 
 router = APIRouter(tags=["Pipeline"])
-
-# # --------- 저장 도우미(심플) ---------
-# BASE_OUTPUT_DIR = Path(os.getenv("PIPELINE_OUTPUT_DIR", "runs"))
-#
-# def _ensure_dir(p: Path) -> None:
-#     p.mkdir(parents=True, exist_ok=True)
-#
-# def _now_str() -> str:
-#     return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-#
-# def _df_to_csv_safe(df: pd.DataFrame, path: Path) -> str:
-#     """
-#     CSV 저장 전 비스칼라(리스트/ndarray/딕트) 셀을 JSON 문자열로 변환.
-#     """
-#     def _ser(v):
-#         if isinstance(v, (list, dict)):
-#             return json.dumps(v, ensure_ascii=False)
-#         if isinstance(v, (np.ndarray,)):
-#             return json.dumps(v.tolist(), ensure_ascii=False)
-#         return v
-#     df_out = df.copy()
-#     for col in df_out.columns:
-#         if df_out[col].dtype == "object":
-#             df_out[col] = df_out[col].map(_ser)
-#     df_out.to_csv(path, index=False)
-#     return str(path)
-#
-# def _save_json(path: Path, obj: Any) -> str:
-#     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-#     return str(path)
 
 # --------- 업로드 파일 → DataFrame 로더 (원본 그대로) ---------
 def _load_table_from_upload(
@@ -183,15 +152,12 @@ async def run_pipeline(
     cutoff_year: int = Form(2025),
     n_clusters: int = Form(100),
     model_name: str = Form("all-MiniLM-L6-v2"),
+    top_n: int = Form(100),
     run_id: str = Form(None),
 ):
     file_bytes = await file.read()
     filename = file.filename
     content_type = file.content_type
-
-    # run_id = run_id or f"{_now_str()}-{uuid.uuid4().hex[:8]}"
-    # outdir = BASE_OUTPUT_DIR / run_id
-    # _ensure_dir(outdir)
 
     async def stream():
         try:
@@ -208,47 +174,48 @@ async def run_pipeline(
             df_filtered = await asyncio.to_thread(filter_df_before_year, df_clean, int(cutoff_year))
 
             # 3) 임베딩
+            yield json.dumps({"step": "임베딩 중", "progress": 40}) + "\n"
             df_embed = await asyncio.to_thread(run_embedding, df_filtered, model_name)
 
-            # 4) 클러스터링/요약
+            # 4) 클러스터링/요약 (메모리 전용)
             yield json.dumps({"step": "클러스터링 및 추세 분석 중", "progress": 70}) + "\n"
             df_clustered, summary = await asyncio.to_thread(run_clustering, df_embed, n_clusters)
 
-            # 5) 네이밍
+            # 5) 네이밍 (artifacts 필수)
             yield json.dumps({"step": "기술명 생성 중", "progress": 90}) + "\n"
-            if isinstance(summary, dict):
-                kw_raw = summary.get("keywords", [])
-                tt_raw = summary.get("titles", [])
-            else:
-                # dict가 아닌 경우(Series/DataFrame/Namespace 등) 속성으로 접근
-                kw_raw = getattr(summary, "keywords", [])
-                tt_raw = getattr(summary, "titles", [])
 
+            if not isinstance(summary, dict) or "artifacts" not in summary:
+                raise RuntimeError("artifacts 준비 실패: run_clustering(summary['artifacts']) 누락")
+
+            # 결과 저장 경로 안내를 위해 OUTPUT_DIR도 포함
+            output_dir = os.getenv("OUTPUT_DIR", "/var/lib/app/outputs")
+
+            naming_result = await asyncio.to_thread(
+                run_tech_naming,
+                None,  # _prompt_ignored
+                artifacts=summary["artifacts"],
+                top_n=int(top_n),
+            )
+
+            # 추가 정보 구성(요약 키워드/타이틀)
+            kw_raw = summary.get("keywords", []) if isinstance(summary, dict) else []
+            tt_raw = summary.get("titles", []) if isinstance(summary, dict) else []
             keywords = _to_str_list(kw_raw)
             titles = _to_str_list(tt_raw)
-
-            year_val = 2024
-            if isinstance(df_clustered, pd.DataFrame) and "year" in df_clustered.columns:
-                try:
-                    year_val = int(pd.to_numeric(df_clustered["year"], errors="coerce").max())
-                except Exception:
-                    year_val = 2024
-
-            prompt = build_user_prompt(
-                flow_id="AUTO_FLOW",
-                cluster_name="자동생성_클러스터",
-                year=year_val,
-                keywords=keywords,
-                rep_titles=titles
-            )
-            naming_result = await asyncio.to_thread(run_tech_naming, prompt)
 
             # 완료
             yield json.dumps({
                 "step": "완료",
                 "progress": 100,
-                "result": {"summary": summary if isinstance(summary, dict) else str(type(summary)),
-                           "naming": naming_result}
+                "result": {
+                    "summary": {
+                        "keywords": keywords,
+                        "titles": titles,
+                        "paths": summary.get("paths", {}),
+                    },
+                    "naming": naming_result,
+                    "output_dir": output_dir
+                }
             }) + "\n"
 
         except Exception as e:
