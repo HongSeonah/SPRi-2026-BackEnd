@@ -1,10 +1,15 @@
 # app/api/pipeline.py
 import asyncio
 import io
+import os
 import csv
 import json
+import uuid
+import datetime as dt
+from pathlib import Path
 from typing import Any, Tuple
 
+import numpy as np
 import pandas as pd
 from fastapi import APIRouter, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
@@ -17,22 +22,47 @@ from app.core.utils_prompt import build_user_prompt
 
 router = APIRouter(tags=["Pipeline"])
 
-# --------- 업로드 파일 → DataFrame 로더 (JSONL 우선) ---------
+# --------- 저장 도우미(심플) ---------
+BASE_OUTPUT_DIR = Path(os.getenv("PIPELINE_OUTPUT_DIR", "runs"))
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def _now_str() -> str:
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+def _df_to_csv_safe(df: pd.DataFrame, path: Path) -> str:
+    """
+    CSV 저장 전 비스칼라(리스트/ndarray/딕트) 셀을 JSON 문자열로 변환.
+    """
+    def _ser(v):
+        if isinstance(v, (list, dict)):
+            return json.dumps(v, ensure_ascii=False)
+        if isinstance(v, (np.ndarray,)):
+            return json.dumps(v.tolist(), ensure_ascii=False)
+        return v
+    df_out = df.copy()
+    for col in df_out.columns:
+        if df_out[col].dtype == "object":
+            df_out[col] = df_out[col].map(_ser)
+    df_out.to_csv(path, index=False)
+    return str(path)
+
+def _save_json(path: Path, obj: Any) -> str:
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+# --------- 업로드 파일 → DataFrame 로더 (원본 그대로) ---------
 def _load_table_from_upload(
     file_bytes: bytes,
     filename: str | None = None,
     content_type: str | None = None,
     prefer_jsonl: bool = True,
 ) -> Tuple[pd.DataFrame, dict]:
-    """
-    업로드 파일을 DataFrame으로 로딩 (JSONL 우선, JSON/CSV/TSV/Excel도 지원)
-    반환: (df, meta)
-    """
     name = (filename or "").lower().strip()
     ctype = (content_type or "").lower().strip()
     encodings = ["utf-8-sig", "utf-8", "cp949", "euc-kr", "latin-1"]
 
-    # 텍스트 스니핑
     sniff_text, sniff_enc = None, None
     for enc in ["utf-8-sig", "utf-8", "latin-1"]:
         try:
@@ -53,7 +83,6 @@ def _load_table_from_upload(
         sample = lines[: min(5, len(lines))]
         return len(sample) > 1 and all(ln.startswith("{") or ln.startswith("[") for ln in sample)
 
-    # JSONL/JSON 내용 우선 감지
     if prefer_jsonl and sniff_text:
         if _looks_like_jsonl(sniff_text):
             try:
@@ -74,13 +103,11 @@ def _load_table_from_upload(
             except Exception:
                 pass
 
-    # Excel
     is_xlsx = name.endswith(".xlsx") or "spreadsheetml" in ctype
     if is_xlsx:
         df_xlsx = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
         return df_xlsx, {"format": "excel"}
 
-    # 확장자/타입 기반 JSON/JSONL
     is_jsonl = any(s in (name, ctype) for s in (".jsonl", ".ndjson", "ndjson"))
     is_json  = any(s in (name, ctype) for s in (".json", "application/json")) and not is_jsonl
     if is_jsonl or is_json:
@@ -112,7 +139,6 @@ def _load_table_from_upload(
                 continue
         raise ValueError(f"Failed to parse JSON: {last_err}")
 
-    # CSV/TSV
     last_err = None
     sample = file_bytes[:20000]
     for enc in encodings:
@@ -139,10 +165,8 @@ def _load_table_from_upload(
             continue
     raise ValueError(f"Failed to parse as CSV/TSV. Last error: {last_err}")
 
-
-# --------- 안전 리스트 변환 (요약값 방어) ---------
+# --------- 안전 리스트 변환 ---------
 def _to_str_list(x: Any) -> list[str]:
-    import pandas as pd
     if x is None:
         return []
     if isinstance(x, (list, tuple)):
@@ -153,54 +177,61 @@ def _to_str_list(x: Any) -> list[str]:
         return x.astype(str).stack().tolist()
     return [str(x)]
 
-
 @router.post("/pipeline/run")
 async def run_pipeline(
     file: UploadFile = File(...),
     cutoff_year: int = Form(2025),
     n_clusters: int = Form(100),
     model_name: str = Form("all-MiniLM-L6-v2"),
+    run_id: str = Form(None),
 ):
-    # 업로드 전체 바이트를 미리 읽어둠 (stream 함수 내부에서 await 불가)
     file_bytes = await file.read()
     filename = file.filename
     content_type = file.content_type
 
+    run_id = run_id or f"{_now_str()}-{uuid.uuid4().hex[:8]}"
+    outdir = BASE_OUTPUT_DIR / run_id
+    _ensure_dir(outdir)
+
     async def stream():
         try:
             # 0) 파일 로드
-            yield json.dumps({"step": "파일 로드 중", "progress": 0}) + "\n"
+            yield json.dumps({"step": "파일 로드 중", "progress": 0, "run_id": run_id}) + "\n"
             df, meta = await asyncio.to_thread(_load_table_from_upload, file_bytes, filename, content_type, True)
             yield json.dumps({"step": "파일 로드 완료", "progress": 5, "meta": {"filename": filename, "content_type": content_type, **meta}}) + "\n"
 
-            # 1) 전처리 (연도 파생 포함)
+            # 1) 전처리
             yield json.dumps({"step": "데이터 전처리 시작", "progress": 10}) + "\n"
             df_clean = await asyncio.to_thread(run_preprocess, df, int(cutoff_year))
+            path_pre = _df_to_csv_safe(df_clean, outdir / "01_preprocessed.csv")
+            yield json.dumps({"step": "데이터 전처리 완료", "progress": 25, "path": path_pre}) + "\n"
 
-            # 2) (선택) 원문 규칙과 동일 부등식(< cutoff_year)로 필터링이 필요하면 아래 사용
-            #    외부 스크립트와 결과 동일성 필요할 때 켜면 됨.
+            # 2) 필터링(< cutoff_year 동일 규칙)
             df_filtered = await asyncio.to_thread(filter_df_before_year, df_clean, int(cutoff_year))
+            path_fil = _df_to_csv_safe(df_filtered, outdir / "02_filtered.csv")
+            yield json.dumps({"step": "필터링 완료", "progress": 35, "path": path_fil}) + "\n"
 
             # 3) 임베딩
-            yield json.dumps({"step": "임베딩 생성 중", "progress": 40}) + "\n"
+            yield json.dumps({"step": "임베딩 생성 중", "progress": 45}) + "\n"
             df_embed = await asyncio.to_thread(run_embedding, df_filtered, model_name)
-
-            # 안전 확인
             if not isinstance(df_embed, pd.DataFrame):
                 raise TypeError(f"run_embedding must return a DataFrame, got {type(df_embed)}")
+            path_emb = _df_to_csv_safe(df_embed, outdir / "03_embedding.csv")
+            yield json.dumps({"step": "임베딩 완료", "progress": 65, "path": path_emb}) + "\n"
 
-            # 4) 클러스터링/추세
-            yield json.dumps({"step": "클러스터링 및 추세 분석 중", "progress": 70}) + "\n"
+            # 4) 클러스터링/요약
+            yield json.dumps({"step": "클러스터링 및 요약 중", "progress": 75}) + "\n"
             df_clustered, summary = await asyncio.to_thread(run_clustering, df_embed, n_clusters)
+            path_clus = _df_to_csv_safe(df_clustered, outdir / "04_clustered.csv")
+            path_sum = _save_json(outdir / "04_summary.json", summary if isinstance(summary, dict) else {"summary_type": str(type(summary))})
+            yield json.dumps({"step": "클러스터링 완료", "progress": 88, "paths": {"clustered": path_clus, "summary": path_sum}}) + "\n"
 
-            # 5) 기술명명 (요약값 강제 정규화)
-            yield json.dumps({"step": "기술명 생성 중", "progress": 90}) + "\n"
-
+            # 5) 네이밍
+            yield json.dumps({"step": "기술명 생성 중", "progress": 92}) + "\n"
             if isinstance(summary, dict):
                 kw_raw = summary.get("keywords", [])
                 tt_raw = summary.get("titles", [])
             else:
-                # dict가 아닌 경우(Series/DataFrame/Namespace 등) 속성으로 접근
                 kw_raw = getattr(summary, "keywords", [])
                 tt_raw = getattr(summary, "titles", [])
 
@@ -222,13 +253,8 @@ async def run_pipeline(
                 rep_titles=titles
             )
             naming_result = await asyncio.to_thread(run_tech_naming, prompt)
-
-            # 완료
-            yield json.dumps({
-                "step": "완료",
-                "progress": 100,
-                "result": {"summary": summary if isinstance(summary, dict) else str(type(summary)), "naming": naming_result}
-            }) + "\n"
+            path_name = _save_json(outdir / "05_naming.json", naming_result)
+            yield json.dumps({"step": "네이밍 완료", "progress": 100, "path": path_name}) + "\n"
 
         except Exception as e:
             yield json.dumps({"step": "오류 발생", "progress": -1, "error": str(e)}) + "\n"
