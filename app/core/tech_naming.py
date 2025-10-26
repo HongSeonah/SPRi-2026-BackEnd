@@ -1,9 +1,8 @@
 # app/core/tech_naming.py
 # ============================================================
-#  기술 네이밍 생성기 (Hybrid + Flow-Aggregated) — 개선판
+#  기술 네이밍 생성기 (Flow-Aggregated)
 #  - OpenAI 호출 병렬화로 처리시간 단축 → 프록시/서버 타임아웃 리스크 완화
 #  - 재시도: 지수 백오프 + 지터, 429/5xx 내성 강화
-#  - METHOD: A(둘다)/H(하이브리드만)/F(플로우집계만)
 #  - 최종 네이밍 CSV만 OUTPUT_DIR에 저장
 #  - 주요 튜닝 ENV:
 #     * OUTPUT_DIR       (기본: /var/lib/app/outputs)
@@ -249,48 +248,6 @@ def _as_completed_results(futures):
             # 호출 단에서 메시지로 변환해 반환하도록 함
             yield {"status": f"error: {type(e).__name__}: {e}"}
 
-def _run_hybrid(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[str, Any]) -> Path:
-    rows_out = []
-    last_nodes = (panel.sort_values("year").groupby("flow_id").tail(1).reset_index(drop=True))
-    last_nodes = last_nodes[last_nodes["flow_id"].isin(target_flows)]
-
-    def _task(rdict):
-        fid = int(rdict["flow_id"]); y = int(rdict["year"]); cid = int(rdict["cluster_id"])
-        keywords = _load_top_terms_artifacts(artifacts, y, cid, topk=TOPK_KEYWORDS)
-        docs_df = _load_cluster_docs_artifacts(artifacts, y, cid)
-        titles  = _rep_titles_via_embeddings(docs_df, n=N_REP_TITLES) if not docs_df.empty else []
-        prompt = (
-            f"[flow_id] {fid}\n[year] {y}\n"
-            f"[keywords] {', '.join(keywords[:TOPK_KEYWORDS])}\n"
-            f"[rep_titles] {'; '.join(titles[:N_REP_TITLES])}"
-        )
-        try:
-            out = _call_gpt(prompt, SYS_HYBRID)
-            return {
-                "flow_id": fid, "year": y, "cluster_id": cid,
-                "tech_name_ko": out.get("tech_name_ko",""),
-                "tech_name_en": out.get("tech_name_en",""),
-                "purpose": out.get("purpose",""),
-                "method": out.get("method",""),
-                "novelty": out.get("novelty",""),
-                "rationale": out.get("rationale",""),
-                "raw_text": out.get("_raw_text",""),
-                "model": OPENAI_MODEL, "status": "ok"
-            }
-        except Exception as e:
-            return {"flow_id": fid, "year": y, "cluster_id": cid,
-                    "status": f"error: {type(e).__name__}: {e}"}
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(_task, r._asdict() if hasattr(r, "_asdict") else r)
-                   for _, r in last_nodes.iterrows()]
-        for res in _as_completed_results(futures):
-            rows_out.append(res)
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows_out).to_csv(OUT_HYBRID, index=False, encoding="utf-8-sig")
-    return OUT_HYBRID
-
 def _run_flowagg(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[str, Any]) -> Path:
     rows_out = []
 
@@ -334,19 +291,14 @@ def _run_flowagg(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[s
     pd.DataFrame(rows_out).to_csv(OUT_FLOWAG, index=False, encoding="utf-8-sig")
     return OUT_FLOWAG
 
-# ---------------- 진입점 ----------------
+
+#################################################################################
+################################# top_n 지정 부분 #################################
+#################################################################################
 def run_tech_naming(_prompt_ignored: str | None = None, *,
                     artifacts: Optional[Dict[str, Any]] = None,
                     top_n: int = 10) -> Dict:
-    """
-    artifacts: run_clustering(...)[1]['artifacts'] 형태
-    top_n: 문서수 합 기준 상위 N개 flow 대상으로 실행
 
-    METHOD (env):
-      - "A": 하이브리드 + 플로우집계 모두 실행
-      - "H": 하이브리드만
-      - "F": 플로우집계만
-    """
     if artifacts is None or not isinstance(artifacts, dict):
         raise RuntimeError("artifacts 가 필요합니다. run_clustering(...)[1]['artifacts'] 를 전달하세요.")
 
@@ -370,20 +322,12 @@ def run_tech_naming(_prompt_ignored: str | None = None, *,
 
     top_flows = _select_top_flows(panel, n=top_n)
 
-    # 3) 하이브리드/플로우집계 네이밍 실행 (최종 결과만 저장)
+    # 3) 플로우집계 네이밍만 실행 (최종 결과만 저장)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    paths = {}
-    run_both = METHOD in ("", "A")
-    if run_both or METHOD == "H":
-        paths["hybrid_csv"] = str(_run_hybrid(panel, top_flows, artifacts))
-    if run_both or METHOD == "F":
-        paths["flowagg_csv"] = str(_run_flowagg(panel, top_flows, artifacts))
-
-    if not paths:
-        # METHOD 설정이 잘못되었을 때 안전장치
-        paths["hybrid_csv"] = str(_run_hybrid(panel, top_flows, artifacts))
-        paths["flowagg_csv"] = str(_run_flowagg(panel, top_flows, artifacts))
+    paths = {
+        "flowagg_csv": str(_run_flowagg(panel, top_flows, artifacts))
+    }
 
     return {"paths": paths, "meta": {
         "top_n": top_n,
@@ -391,7 +335,7 @@ def run_tech_naming(_prompt_ignored: str | None = None, *,
         "request_timeout_s": REQUEST_TIMEOUT_S,
         "retry": GPT_RETRY,
         "backoff_base": BACKOFF_BASE,
-        "method": METHOD,
+        "method": "F",
         "label_suffix": LABEL_SUFFIX,
         "model": OPENAI_MODEL,
     }}

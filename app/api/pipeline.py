@@ -171,6 +171,7 @@ async def run_pipeline(
             df_clean = await asyncio.to_thread(run_preprocess, df, int(cutoff_year))
 
             # 2) 필터링(< cutoff_year 동일 규칙)
+            yield json.dumps({"step": "데이터 필터링 시작", "progress": 25}) + "\n"
             df_filtered = await asyncio.to_thread(filter_df_before_year, df_clean, int(cutoff_year))
 
             # 3) 임베딩
