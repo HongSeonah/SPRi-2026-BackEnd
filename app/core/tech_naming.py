@@ -294,7 +294,7 @@ def _run_flowagg(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[s
 # ---------------- 진입점 ----------------
 def run_tech_naming(_prompt_ignored: str | None = None, *,
                     artifacts: Optional[Dict[str, Any]] = None,
-                    top_n: int = 100) -> Dict:
+                    top_n: int = 10) -> Dict:
     if artifacts is None or not isinstance(artifacts, dict):
         raise RuntimeError("artifacts 가 필요합니다. run_clustering(...)[1]['artifacts'] 를 전달하세요.")
     # 1) 패널 구성(artifacts의 flow_edges_df 사용)
