@@ -212,18 +212,27 @@ def _rep_titles_via_embeddings(df_c: pd.DataFrame, n:int=3) -> List[str]:
 TOPK_KEYWORDS = 40
 N_REP_TITLES  = 3
 
-SYS_HYBRID = (
-    "당신은 기술 네이밍 비서입니다. 입력된 클러스터의 키워드와 대표 타이틀을 보고 "
-    "① 목적, ② 구현 방법, ③ 신규 기여를 간결히 요약하고, 한국어/영문 기술명을 JSON으로만 출력하세요.\n"
-    "반드시 아래 키를 포함한 JSON만 출력하세요:\n"
-    '{"tech_name_ko":"","tech_name_en":"","purpose":"","method":"","novelty":"","rationale":""}'
-)
+# SYS_HYBRID = (
+#     "당신은 기술 네이밍 비서입니다. 입력된 클러스터의 키워드와 대표 타이틀을 보고 "
+#     "① 목적, ② 구현 방법, ③ 신규 기여를 간결히 요약하고, 한국어/영문 기술명을 JSON으로만 출력하세요.\n"
+#     "반드시 아래 키를 포함한 JSON만 출력하세요:\n"
+#     '{"tech_name_ko":"","tech_name_en":"","purpose":"","method":"","novelty":"","rationale":""}'
+# )
 
 SYS_FLOWAG = (
-    "당신은 기술 네이밍 컨설턴트입니다. 흐름 전체의 상위 키워드를 보고 "
-    "목적/방법/신규기여를 요약하고 한국어/영문 기술명을 JSON으로만 출력하세요.\n"
-    "반드시 아래 키를 포함한 JSON만 출력하세요:\n"
-    '{"tech_name_ko":"","tech_name_en":"","purpose":"","method":"","novelty":"","rationale":""}'
+    "당신은 기술 네이밍 비서입니다. 입력된 클러스터의 키워드와 대표 타이틀을 보고 "
+    "① 기술의 '목적', ② '구현 방법', ③ '신규 기여'를 간결히 도출한 다음, "
+    "이를 근거로 한국어/영문 기술명을 제안하세요.\n\n"
+    "출력은 반드시 JSON만 반환:\n"
+    "{"
+    "\"tech_name_ko\":\"(18자 이내, 고유명/축약 가능)\","
+    "\"tech_name_en\":\"(3~5 words, 명료한 표현)\","
+    "\"purpose\":\"~을/를 위한 ~\","
+    "\"method\":\"핵심 접근/알고리즘/데이터/시스템\","
+    "\"novelty\":\"기존 대비 차별점(1~2문장)\","
+    "\"rationale\":\"이 이름을 선택한 이유(한국어 1문장)\""
+    "}\n"
+    "금지: 과도한 일반명사, 과장, 특정 상표명 차용."
 )
 
 def _load_cluster_docs_artifacts(artifacts: Dict[str, Any], year:int, cluster_id:int) -> pd.DataFrame:
