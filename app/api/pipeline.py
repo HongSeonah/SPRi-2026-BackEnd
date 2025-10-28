@@ -18,8 +18,16 @@ from app.core.preprocess import run_preprocess, filter_df_before_year
 from app.core.embedding import run_embedding
 from app.core.clustering import run_clustering
 from app.core.tech_naming import run_tech_naming
+from app.core.component_tech_grouper import run_component_grouping, ComponentTechConfig
+from app.core.component_tech_naming import generate_component_names_csv
 
 router = APIRouter(tags=["Pipeline"])
+
+# ============================================================
+# 환경설정
+# ============================================================
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/var/lib/app/outputs")).resolve()
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------- 유틸: 포맷 스니핑 ----------------------
 def _looks_like_json(txt: str) -> bool:
@@ -153,6 +161,7 @@ async def _save_upload_to_tempfile(file: UploadFile) -> Path:
             tmp_path.unlink(missing_ok=True)
         raise
 
+
 @router.post("/pipeline/run")
 async def run_pipeline(
     file: UploadFile = File(...),
@@ -167,6 +176,9 @@ async def run_pipeline(
       - 업로드는 임시파일에만 저장(요청 끝나면 삭제)
       - 중간 산출물도 메모리/임시파일로만 사용
       - 진행상황을 JSON 라인으로 스트리밍
+      - 결과물: OUTPUT_DIR에 CSV 2개 저장
+          * 요소기술 네이밍: names_generated_flowagg.csv
+          * 구성기술 네이밍: component_tech_names.csv
     """
     rid = run_id or uuid.uuid4().hex
     temp_paths: list[Path] = []
@@ -212,85 +224,89 @@ async def run_pipeline(
                 except Exception:
                     pass
 
-            # 비동기 태스크로 임베딩 실행
+            # 임베딩 실행
             task_embed = asyncio.create_task(asyncio.to_thread(
                 run_embedding,
                 df_filtered,
                 model_name,
-                # 아래 두 파라미터 추가: 체크포인트/리줌 권장
+                # 체크포인트 사용 시 재개 가능 (문제 있으면 resume=False 권장)
                 batch_size=512,
                 checkpoint_dir=f"/tmp/emb_ckpt/{rid}",
                 resume=True,
                 progress_cb=_progress_cb,
             ))
 
-            # 진행 상황을 더 자주 반영 (예: 2초 주기)
+            # 진행 상황 하트비트
             HB_INTERVAL = 2
-            try:
-                while not task_embed.done():
-                    try:
-                        # 대기 시간 동안 콜백이 넣은 최신 진척을 모두 비움
-                        # (최근값만 쓰면 충분하므로 큐를 비우고 마지막만 사용)
-                        await asyncio.sleep(HB_INTERVAL)
-                        while True:
-                            last_progress = progress_q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
+            while not task_embed.done():
+                try:
+                    await asyncio.sleep(HB_INTERVAL)
+                    while True:
+                        last_progress = progress_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
 
-                    if last_progress is not None:
-                        processed, total = last_progress
-                        pct = 40 + (processed / max(total, 1)) * 30  # 40~70 구간 활용
-                        yield json.dumps({
-                            "step": "ping",
-                            "progress": int(pct),
-                            "meta": {
-                                "stage": "embedding",
-                                "processed": processed,
-                                "total": total,
-                                "batch_size": 512
-                            }
-                        }, ensure_ascii=False) + "\n"
-                    else:
-                        # 아직 콜백 신호가 없을 때도 최소 하트비트 유지
-                        yield json.dumps({"step": "ping", "progress": 41}, ensure_ascii=False) + "\n"
+                if last_progress is not None:
+                    processed, total = last_progress
+                    pct = 40 + (processed / max(total, 1)) * 30  # 40~70
+                    yield json.dumps({
+                        "step": "ping",
+                        "progress": int(pct),
+                        "meta": {"stage": "embedding", "processed": processed, "total": total, "batch_size": 512}
+                    }, ensure_ascii=False) + "\n"
+                else:
+                    yield json.dumps({"step": "ping", "progress": 41}, ensure_ascii=False) + "\n"
 
-                # 임베딩 완료 결과 수집
-                df_embed = await task_embed
-            except Exception as e:
-                yield json.dumps({"step": "오류 발생", "progress": -1, "error": f"embedding: {e}"},
-                                 ensure_ascii=False) + "\n"
-                return
+            # 임베딩 완료 결과 수집
+            df_embed = await task_embed
 
             # 5) 클러스터링/요약
             yield json.dumps({"step": "클러스터링 및 추세 분석 중", "progress": 70}, ensure_ascii=False) + "\n"
-            try:
-                df_clustered, summary = await asyncio.to_thread(run_clustering, df_embed, n_clusters)
-                if not isinstance(summary, dict) or "artifacts" not in summary:
-                    raise RuntimeError("artifacts 누락")
-            except Exception as e:
-                yield json.dumps({"step": "오류 발생", "progress": -1, "error": f"clustering: {e}"}, ensure_ascii=False) + "\n"
-                return
+            df_clustered, summary = await asyncio.to_thread(run_clustering, df_embed, n_clusters)
+            if not isinstance(summary, dict) or "artifacts" not in summary:
+                raise RuntimeError("artifacts 누락")
 
-            # 6) 네이밍
-            yield json.dumps({"step": "기술명 생성 중", "progress": 90}, ensure_ascii=False) + "\n"
-            try:
-                naming_result = await asyncio.to_thread(
-                    run_tech_naming, None, artifacts=summary["artifacts"], top_n=int(top_n)
-                )
-            except Exception as e:
-                yield json.dumps({"step": "오류 발생", "progress": -1, "error": f"naming: {e}"}, ensure_ascii=False) + "\n"
-                return
+            # 6) 요소기술 네이밍 (flow-agg) → OUTPUT_DIR/names_generated_flowagg.csv
+            yield json.dumps({"step": "기술명 생성 중", "progress": 85}, ensure_ascii=False) + "\n"
+            naming_result = await asyncio.to_thread(
+                run_tech_naming, None, artifacts=summary["artifacts"], top_n=int(top_n)
+            )
+            elem_csv_path = naming_result["paths"].get("flowagg_csv", "")
 
-            # 완료(결과만 전송, 파일 저장 없음)
-            keywords = _to_str_list(summary.get("keywords", []))
-            titles = _to_str_list(summary.get("titles", []))
+            # 7) 구성기술 묶기 (메모리 전용; 디스크 저장 없음)
+            yield json.dumps({"step": "구성기술 묶는 중", "progress": 90}, ensure_ascii=False) + "\n"
+            cfg = ComponentTechConfig(
+                n_components=int(n_clusters),
+                year_col="year",
+                embed_col="embedding",
+                cluster_col=summary["paths"]["label_col"],
+                random_state=42,
+            )
+            df_component, comp_summary = await asyncio.to_thread(run_component_grouping, df_clustered, cfg)
+
+            # 8) 구성기술 네이밍(전체) → OUTPUT_DIR/component_tech_names.csv
+            yield json.dumps({"step": "구성기술 네이밍 중", "progress": 96}, ensure_ascii=False) + "\n"
+            comp_csv_path = await asyncio.to_thread(
+                generate_component_names_csv,
+                df_component,
+                label_col="component_tech_id",
+                text_cols=("title",),
+                output_csv_path=None,   # 내부에서 OUTPUT_DIR 사용
+            )
+
+            # 9) 완료(결과 경로 전송)
+            keywords = _to_str_list(summary.get("keywords", []))[:100]
+            titles = _to_str_list(summary.get("titles", []))[:100]
             yield json.dumps(
                 {
                     "step": "완료",
                     "progress": 100,
                     "result": {
+                        "outputs": {
+                            "element_names_csv": elem_csv_path,
+                            "component_names_csv": comp_csv_path,
+                        },
                         "summary": {"keywords": keywords, "titles": titles, "paths": summary.get("paths", {})},
-                        "naming": naming_result,
                         "run_id": rid,
                     },
                 },
@@ -300,7 +316,7 @@ async def run_pipeline(
         except Exception as e:
             yield json.dumps({"step": "오류 발생", "progress": -1, "error": str(e)}, ensure_ascii=False) + "\n"
         finally:
-            # 임시파일 정리(영구 저장 방지)
+            # 임시파일 정리
             for p in temp_paths:
                 try:
                     p.unlink(missing_ok=True)
