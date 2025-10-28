@@ -215,16 +215,51 @@ async def run_pipeline(
             df_year = await asyncio.to_thread(filter_df_before_year, df, int(cutoff_year))
             print(f"✅ 연도 필터링 완료: {len(df_year):,}개의 데이터")
 
-            # 3) 전처리
+            # 3) 전처리 (콜백 + 하트비트)
             yield j({"step": "데이터 전처리 시작", "progress": 20})
-            df_clean = await asyncio.to_thread(
+
+            pre_q: asyncio.Queue = asyncio.Queue()
+            loop = asyncio.get_event_loop()
+
+            def _pre_cb(processed: int, total: int, stage: str):
+                try:
+                    loop.call_soon_threadsafe(pre_q.put_nowait, (processed, total, stage))
+                except Exception:
+                    pass
+
+            task_pre = asyncio.create_task(asyncio.to_thread(
                 run_preprocess,
                 df_year,
                 int(cutoff_year),
                 do_cpc_match=True,
                 cpc_csv_path=get_cpc_path(),
-            )
+                # 필요 시 튜닝
+                # cpc_batch_size=256,
+                # cpc_threshold=0.35,
+                progress_cb=_pre_cb,  # 🔹 콜백 주입
+            ))
+
+            HB_INTERVAL = 2
+            last_pre: Optional[tuple[int, int, str]] = None
+            while not task_pre.done():
+                try:
+                    await asyncio.sleep(HB_INTERVAL)
+                    while True:
+                        last_pre = pre_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+
+                if last_pre is not None:
+                    proc, tot, stage = last_pre
+                    pct = 20 + (proc / max(tot, 1)) * 20  # 20~40% 구간
+                    yield j({"step": "ping", "progress": int(pct),
+                             "meta": {"stage": stage, "processed": proc, "total": tot}})
+                else:
+                    yield j({"step": "ping", "progress": 21, "meta": {"stage": "preprocess_idle"}})
+
+            df_clean = await task_pre
             print(f"✅ 전처리 완료: {len(df_clean):,}개의 데이터")
+            yield j({"step": "데이터 전처리 완료", "progress": 40, "meta": {"rows": len(df_clean)}})
 
             # 4) 임베딩 (하트비트 포함)
             yield j({"step": "임베딩 중", "progress": 40})

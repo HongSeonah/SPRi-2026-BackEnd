@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import json
-from typing import Iterable, IO, Optional, List, Tuple, Sequence, Literal, Union
+from typing import Iterable, IO, Optional, List, Tuple, Sequence, Literal, Union, Callable
 from pathlib import Path
 from pathlib import Path
 import os
 
+import numpy as np
 import pandas as pd
 
 # ▼ CPC 매칭용 (semantic)
@@ -400,60 +401,58 @@ def get_cpc_path() -> str:
 # 공개 전처리 엔트리포인트 (확장: CPC 매칭 포함 가능)
 # =========================================================
 
+# app/core/preprocess.py (상단 import에 추가)
 def run_preprocess(
     df: pd.DataFrame,
     cutoff_year: int = 2025,
     *,
-    # ▼ 키워드 필터 옵션
+    # ▼ 새 옵션들
     keyword_mode: Optional[Literal["literal", "semantic"]] = None,
     keywords: Optional[Sequence[str]] = None,
+    # literal 모드 옵션
     case_insensitive: bool = True,
     use_regex: bool = False,
+    # semantic 모드 옵션
     semantic_threshold: float = 0.30,
     semantic_model_name: str = "all-MiniLM-L6-v2",
     semantic_normalize: bool = True,
     semantic_device: Optional[str] = None,
     add_score_cols: bool = True,
-    # ▼ CPC 매칭 옵션 (추가)
+    # ▼ CPC 매칭(새)
     do_cpc_match: bool = False,
-    cpc_df: Optional[pd.DataFrame] = None,
     cpc_csv_path: Optional[str] = None,
-    cpc_title_col: str = "cpc_title",
-    cpc_symbol_col: str = "SYMBOL",
-    cpc_match_threshold: float = 0.30,
-    cpc_model_name: str = "all-MiniLM-L6-v2",
-    cpc_normalize: bool = True,
+    cpc_batch_size: int = 512,
+    cpc_threshold: float = 0.30,
     cpc_device: Optional[str] = None,
-    cpc_batch_size: int = 2048,
-    # 텍스트 결합 컬럼 기본
-    paper_text_cols_for_cpc: Sequence[str] = ("abstract",),
+    # ▼ 진행 콜백(새): (processed, total, stage)
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
     **kwargs
 ) -> pd.DataFrame:
     """
-    파이프라인에서 호출되는 전처리 함수.
-    1) year 파생
-    2) 제목/초록 빈 행 제거
-    3) (옵션) 키워드 기반 필터링: literal 또는 semantic
-    4) (옵션) CPC 매칭: df + CPC(df 또는 csv) → matched_cpc/description/similarity/final_cpc 등 추가
-    * 연도 필터(< cutoff_year)는 호출자(filter_df_before_year)에서 적용시키는 기존 구조 유지
+    전처리 + (옵션) 키워드 필터 + (옵션) CPC 매칭.
+    progress_cb(processed:int, total:int, stage:str) 형태로 진행 상황 콜백을 호출.
     """
-    out = _derive_year(df)
+    def _ping(proc: int, tot: int, stage: str):
+        if progress_cb:
+            try:
+                progress_cb(int(proc), int(tot), str(stage))
+            except Exception:
+                pass
 
+    # 0) 시작
+    total_in = len(df)
+    _ping(0, max(total_in, 1), "preprocess_start")
+
+    # 1) year 파생 + 빈행 제거
+    out = _derive_year(df)
     title_col = "title" if "title" in out.columns else None
     abstr_col = "abstract" if "abstract" in out.columns else None
 
-    if title_col is None and abstr_col is None:
-        # 텍스트 컬럼이 없으면 year만 파생
-        # (CPC 매칭도 수행 불가 → 그대로 반환)
-        return out.reset_index(drop=True)
-
-    # 문자열화 + NaN -> ""
     if title_col:
         out[title_col] = out[title_col].astype(str).fillna("")
     if abstr_col:
         out[abstr_col] = out[abstr_col].astype(str).fillna("")
 
-    # 제목/초록 모두 빈 문자열인 행 제거
     if title_col and abstr_col:
         mask_keep = (out[title_col].str.len() > 0) | (out[abstr_col].str.len() > 0)
         out = out[mask_keep]
@@ -462,7 +461,9 @@ def run_preprocess(
     elif abstr_col:
         out = out[out[abstr_col].str.len() > 0]
 
-    # ▼ 키워드 기반 필터(옵션)
+    _ping(len(out), max(total_in, 1), "clean_done")
+
+    # 2) 키워드 필터(옵션)
     if keyword_mode and keywords:
         if keyword_mode == "literal":
             out = filter_df_by_keywords_literal(
@@ -472,6 +473,7 @@ def run_preprocess(
                 use_regex=use_regex
             )
         elif keyword_mode == "semantic":
+            # semantic은 기존 함수를 그대로 쓰되 완료 신호만 보냄
             out = filter_df_by_keywords_semantic(
                 out, keywords,
                 text_cols=tuple([c for c in ("title", "abstract") if c in out.columns]),
@@ -483,22 +485,90 @@ def run_preprocess(
             )
         else:
             raise ValueError("keyword_mode 는 None, 'literal', 'semantic' 중 하나여야 합니다.")
+        _ping(len(out), max(total_in, 1), "keyword_filter_done")
 
-    # ▼ CPC 매칭(옵션)
+    # 3) CPC 매칭(옵션) — 배치 진행률 콜백
     if do_cpc_match:
-        # 소스 준비
-        _cpc_df = cpc_df
-        if _cpc_df is None and cpc_csv_path:
-            _cpc_df = pd.read_csv(cpc_csv_path)
-        if _cpc_df is None:
-            raise ValueError("do_cpc_match=True 인데 cpc_df/cpc_csv_path 가 없습니다.")
+        if not cpc_csv_path:
+            raise ValueError("do_cpc_match=True 인데 cpc_csv_path가 없습니다.")
+        df_cpc = pd.read_csv(cpc_csv_path)
+        if "SYMBOL" not in df_cpc.columns or "cpc_title" not in df_cpc.columns:
+            raise ValueError("CPC CSV에는 'SYMBOL', 'cpc_title' 컬럼이 필요합니다.")
 
-        out = match_cpc_to_papers(
-            out, _cpc_df,
-            paper_text_cols=paper_text_cols_for_cpc,
-            cpc_title_col=cpc_title_col, cpc_symbol_col=cpc_symbol_col,
-            model_name=cpc_model_name, threshold=cpc_match_threshold,
-            normalize=cpc_normalize, device=cpc_device, batch_size=cpc_batch_size
+        # 클린
+        def _clean(txt: str) -> str:
+            import re
+            if not isinstance(txt, str):
+                return ""
+            txt = txt.lower()
+            txt = re.sub(r"[^a-z0-9#\+\/\-\.\s]", " ", txt)
+            txt = re.sub(r"\s+", " ", txt).strip()
+            return txt
+
+        df_cpc = df_cpc.copy()
+        df_cpc["cpc_title_clean"] = df_cpc["cpc_title"].fillna("").astype(str).map(_clean)
+
+        use_cols = [c for c in ("title", "abstract") if c in out.columns]
+        out = out.copy()
+        out["__text__"] = out.apply(lambda r: " ".join([str(r[c]) for c in use_cols]), axis=1).fillna("").astype(str).map(_clean)
+
+        # 임베딩 & 배치 매칭
+        from sentence_transformers import SentenceTransformer, util
+        import torch
+
+        device = cpc_device or ("cuda" if torch.cuda.is_available() else "cpu")
+        model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+
+        cpc_emb = model.encode(
+            df_cpc["cpc_title_clean"].tolist(),
+            convert_to_tensor=True, normalize_embeddings=True, show_progress_bar=False, device=device
         )
+        SYMS = df_cpc["SYMBOL"].tolist()
+        TITLES = df_cpc["cpc_title"].tolist()
 
-    return out.reset_index(drop=True)
+        texts = out["__text__"].tolist()
+        T = len(texts)
+        _ping(0, max(T, 1), "cpc_match")
+
+        bs = int(cpc_batch_size)
+        best_sym = np.empty(T, dtype=object)
+        best_desc = np.empty(T, dtype=object)
+        best_score = np.empty(T, dtype=np.float32)
+
+        for i in range(0, T, bs):
+            j = min(i + bs, T)
+            batch = texts[i:j]
+            abs_emb = model.encode(
+                batch, convert_to_tensor=True, normalize_embeddings=True, show_progress_bar=False, device=device
+            )
+            sim = util.cos_sim(abs_emb, cpc_emb)            # [B x N_cpc]
+            scores, idx = torch.max(sim, dim=1)
+
+            idx_np = idx.detach().cpu().numpy()
+            scores_np = scores.detach().cpu().numpy().astype(np.float32)
+
+            best_sym[i:j] = [SYMS[k] for k in idx_np]
+            best_desc[i:j] = [TITLES[k] for k in idx_np]
+            best_score[i:j] = scores_np
+
+            _ping(j, max(T, 1), "cpc_match")               # 🔹 배치 진행률 콜백
+
+        out["matched_cpc"] = best_sym
+        out["matched_cpc_description"] = best_desc
+        out["similarity"] = best_score
+
+        # threshold 적용
+        if cpc_threshold is not None:
+            def _final_row(sim, sym, desc):
+                if float(sim) >= float(cpc_threshold):
+                    return sym, desc
+                return "exploration", "Exploratory Topic (Uncertain CPC Match)"
+            final = [ _final_row(s, a, b) for s, a, b in zip(best_score, best_sym, best_desc) ]
+            out["final_cpc"] = [x[0] for x in final]
+            out["final_cpc_description"] = [x[1] for x in final]
+        _ping(T, max(T, 1), "cpc_match_done")
+
+    # 마무리
+    out = out.drop(columns=["__text__"], errors="ignore").reset_index(drop=True)
+    _ping(len(out), max(total_in, 1), "preprocess_done")
+    return out
