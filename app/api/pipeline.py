@@ -216,6 +216,8 @@ async def run_pipeline(
                 cpc_csv_path=get_cpc_path(),
             )
 
+            print(f"✅ 전처리 완료: {len(df_clean):,}개의 데이터")
+
             # 4) 임베딩 (하트비트 포함)
             yield json.dumps({"step": "임베딩 중", "progress": 40}, ensure_ascii=False) + "\n"
 
