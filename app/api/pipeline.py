@@ -7,7 +7,7 @@ import json
 import uuid
 import tempfile
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -200,14 +200,65 @@ async def run_pipeline(
 
             # 4) 임베딩 (하트비트 포함)
             yield json.dumps({"step": "임베딩 중", "progress": 40}, ensure_ascii=False) + "\n"
+
+            progress_q: asyncio.Queue = asyncio.Queue()
+            loop = asyncio.get_event_loop()
+            last_progress: Optional[tuple[int, int]] = None  # (processed, total)
+
+            def _progress_cb(processed: int, total: int):
+                # run_embedding은 to_thread에서 돌기 때문에, 스레드-세이프하게 이벤트루프로 넘겨야 함
+                try:
+                    loop.call_soon_threadsafe(progress_q.put_nowait, (processed, total))
+                except Exception:
+                    pass
+
+            # 비동기 태스크로 임베딩 실행
+            task_embed = asyncio.create_task(asyncio.to_thread(
+                run_embedding,
+                df_filtered,
+                model_name,
+                # 아래 두 파라미터 추가: 체크포인트/리줌 권장
+                batch_size=512,
+                checkpoint_dir=f"/tmp/emb_ckpt/{rid}",
+                resume=True,
+                progress_cb=_progress_cb,
+            ))
+
+            # 진행 상황을 더 자주 반영 (예: 2초 주기)
+            HB_INTERVAL = 2
             try:
-                task_embed = asyncio.create_task(asyncio.to_thread(run_embedding, df_filtered, model_name))
                 while not task_embed.done():
-                    await asyncio.sleep(8)
-                    yield json.dumps({"step": "ping", "progress": 41}, ensure_ascii=False) + "\n"
+                    try:
+                        # 대기 시간 동안 콜백이 넣은 최신 진척을 모두 비움
+                        # (최근값만 쓰면 충분하므로 큐를 비우고 마지막만 사용)
+                        await asyncio.sleep(HB_INTERVAL)
+                        while True:
+                            last_progress = progress_q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+
+                    if last_progress is not None:
+                        processed, total = last_progress
+                        pct = 40 + (processed / max(total, 1)) * 30  # 40~70 구간 활용
+                        yield json.dumps({
+                            "step": "ping",
+                            "progress": int(pct),
+                            "meta": {
+                                "stage": "embedding",
+                                "processed": processed,
+                                "total": total,
+                                "batch_size": 512
+                            }
+                        }, ensure_ascii=False) + "\n"
+                    else:
+                        # 아직 콜백 신호가 없을 때도 최소 하트비트 유지
+                        yield json.dumps({"step": "ping", "progress": 41}, ensure_ascii=False) + "\n"
+
+                # 임베딩 완료 결과 수집
                 df_embed = await task_embed
             except Exception as e:
-                yield json.dumps({"step": "오류 발생", "progress": -1, "error": f"embedding: {e}"}, ensure_ascii=False) + "\n"
+                yield json.dumps({"step": "오류 발생", "progress": -1, "error": f"embedding: {e}"},
+                                 ensure_ascii=False) + "\n"
                 return
 
             # 5) 클러스터링/요약
