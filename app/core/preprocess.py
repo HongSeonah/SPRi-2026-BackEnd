@@ -6,11 +6,12 @@ from typing import Iterable, IO, Optional, List, Tuple
 import pandas as pd
 from fastapi import APIRouter
 from pathlib import Path
+from typing import Sequence, Literal, Union
 
 router = APIRouter()
 
 # =========================================================
-# JSONL 유틸 (원문 동작과 동일성 보장: update_date[:4].isdigit() + int < cutoff)
+# JSONL 유틸 (update_date[:4].isdigit() + int < cutoff)
 # =========================================================
 
 def _iter_jsonl_lines(
@@ -55,6 +56,108 @@ def count_before_year_stream(fp: IO[str], cutoff_year: int) -> int:
         if y >= 0 and y < int(cutoff_year):
             cnt += 1
     return cnt
+
+def _concat_text(row: pd.Series, cols: Sequence[str]) -> str:
+    """
+    주어진 컬럼들을 공백으로 이어붙여 검색/유사도용 텍스트 생성.
+    None/NaN은 빈 문자열로 처리.
+    """
+    parts = []
+    for c in cols:
+        if c in row and pd.notna(row[c]):
+            parts.append(str(row[c]))
+    return " ".join(parts).strip()
+
+def filter_df_by_keywords_literal(
+    df: pd.DataFrame,
+    keywords: Sequence[str],
+    *,
+    text_cols: Sequence[str] = ("title", "abstract"),
+    case_insensitive: bool = True,
+    use_regex: bool = False
+) -> pd.DataFrame:
+    """
+    문자열 매칭으로 키워드가 하나라도 포함된 행만 남김.
+    - 기본: 대소문자 무시, 정규식 미사용(부분문자열 포함 검사).
+    - text_cols 중 존재하는 컬럼만 사용.
+    """
+    use_cols = [c for c in text_cols if c in df.columns]
+    if not use_cols or not keywords:
+        return df.copy()
+
+    proc = df.copy()
+    if case_insensitive:
+        kw_list = [str(k).lower() for k in keywords]
+        def _hit(row: pd.Series) -> bool:
+            text = _concat_text(row, use_cols).lower()
+            if use_regex:
+                import re
+                return any(re.search(k, text) is not None for k in kw_list)
+            return any(k in text for k in kw_list)
+    else:
+        kw_list = [str(k) for k in keywords]
+        def _hit(row: pd.Series) -> bool:
+            text = _concat_text(row, use_cols)
+            if use_regex:
+                import re
+                return any(re.search(k, text) is not None for k in kw_list)
+            return any(k in text for k in kw_list)
+
+    mask = proc.apply(_hit, axis=1)
+    return proc[mask].copy().reset_index(drop=True)
+
+def filter_df_by_keywords_semantic(
+    df: pd.DataFrame,
+    keywords: Sequence[str],
+    *,
+    text_cols: Sequence[str] = ("title", "abstract"),
+    model_name: str = "all-MiniLM-L6-v2",
+    threshold: float = 0.30,
+    normalize: bool = True,
+    device: Optional[str] = None,
+    add_score_cols: bool = True
+) -> pd.DataFrame:
+    """
+    문장 임베딩 유사도로 키워드와 유사한 행만 남김.
+    - 각 행의 텍스트(예: title+abstract) vs. 키워드 리스트의 유사도 중 최댓값이 threshold 이상이면 keep
+    - 결과에 best_keyword, similarity 컬럼(옵션) 추가
+    """
+    use_cols = [c for c in text_cols if c in df.columns]
+    if not use_cols or not keywords:
+        return df.copy()
+
+    try:
+        from sentence_transformers import SentenceTransformer, util
+        import torch
+    except Exception as e:
+        raise ImportError(
+            "sentence-transformers 가 필요합니다. "
+            "pip install sentence-transformers 로 설치 후 사용하세요."
+        ) from e
+
+    proc = df.copy()
+    texts = proc.apply(lambda r: _concat_text(r, use_cols), axis=1).fillna("").astype(str).tolist()
+
+    # 디바이스 결정
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = SentenceTransformer(model_name, device=device)
+    text_emb = model.encode(texts, convert_to_tensor=True, normalize_embeddings=normalize, show_progress_bar=False, device=device)
+    kw_emb = model.encode(list(map(str, keywords)), convert_to_tensor=True, normalize_embeddings=normalize, show_progress_bar=False, device=device)
+
+    sim = util.cos_sim(text_emb, kw_emb)  # [num_rows x num_keywords]
+    best_scores, best_idx = sim.max(dim=1)
+
+    keep_mask = best_scores >= float(threshold)
+    kept = proc[keep_mask.cpu().numpy()].copy().reset_index(drop=True)
+
+    if add_score_cols:
+        kept["similarity"] = best_scores[keep_mask].cpu().numpy()
+        kept["best_keyword"] = [keywords[i] for i in best_idx[keep_mask].cpu().tolist()]
+
+    return kept
+
 
 
 def filter_before_year_stream_to_df(fp: IO[str], cutoff_year: int) -> pd.DataFrame:
@@ -183,25 +286,38 @@ def filter_df_before_year(df: pd.DataFrame, cutoff_year: int) -> pd.DataFrame:
 def run_preprocess(
     df: pd.DataFrame,
     cutoff_year: int = 2025,
+    *,
+    # ▼ 새 옵션들
+    keyword_mode: Optional[Literal["literal", "semantic"]] = None,
+    keywords: Optional[Sequence[str]] = None,
+    # literal 모드 옵션
+    case_insensitive: bool = True,
+    use_regex: bool = False,
+    # semantic 모드 옵션
+    semantic_threshold: float = 0.30,
+    semantic_model_name: str = "all-MiniLM-L6-v2",
+    semantic_normalize: bool = True,
+    semantic_device: Optional[str] = None,
+    add_score_cols: bool = True,
     **kwargs
 ) -> pd.DataFrame:
     """
     파이프라인에서 호출되는 전처리 함수.
-    - 텍스트(제목/초록)는 그대로 둠(내용 변형 없음)
-    - 'year' 파생만 수행(슬라이싱 방식)
-    - 제목/초록이 모두 비어있는 레코드는 제거(둘 다 공백/빈문자열이면 drop)
-    - '연도 필터(< cutoff_year)'는 호출자에서 선택적으로 적용
+    - year 파생
+    - 제목/초록 모두 빈 행 제거
+    - (옵션) 키워드 기반 필터링: literal 또는 semantic
+    - *연도 필터(< cutoff_year)는 호출자에서 선택적으로 적용*
     """
     out = _derive_year(df)
 
     title_col = "title" if "title" in out.columns else None
     abstr_col = "abstract" if "abstract" in out.columns else None
 
-    # 둘 다 없으면 그대로 반환 (임베딩 단계 등에서 처리)
     if title_col is None and abstr_col is None:
+        # 텍스트 컬럼이 없으면 year 파생만 적용한 결과 반환
         return out.reset_index(drop=True)
 
-    # 문자열화 + NaN -> "" (내용 자체는 변경하지 않음)
+    # 문자열화 + NaN -> ""
     if title_col:
         out[title_col] = out[title_col].astype(str).fillna("")
     if abstr_col:
@@ -216,60 +332,26 @@ def run_preprocess(
     elif abstr_col:
         out = out[out[abstr_col].str.len() > 0]
 
+    # ▼ 키워드 기반 필터(옵션)
+    if keyword_mode and keywords:
+        if keyword_mode == "literal":
+            out = filter_df_by_keywords_literal(
+                out, keywords,
+                text_cols=tuple([c for c in ("title", "abstract") if c in out.columns]),
+                case_insensitive=case_insensitive,
+                use_regex=use_regex
+            )
+        elif keyword_mode == "semantic":
+            out = filter_df_by_keywords_semantic(
+                out, keywords,
+                text_cols=tuple([c for c in ("title", "abstract") if c in out.columns]),
+                model_name=semantic_model_name,
+                threshold=semantic_threshold,
+                normalize=semantic_normalize,
+                device=semantic_device,
+                add_score_cols=add_score_cols
+            )
+        else:
+            raise ValueError("keyword_mode 는 None, 'literal', 'semantic' 중 하나여야 합니다.")
+
     return out.reset_index(drop=True)
-
-
-# =========================================================
-# (선택) 간단한 CLI 유틸: 모듈을 단독 실행했을 때 원문 스크립트와 유사 동작
-#   python -m app.core.preprocess count <input_jsonl> [cutoff_year]
-#   python -m app.core.preprocess filter <input_jsonl> <output_jsonl> [cutoff_year]
-#   python -m app.core.preprocess tocsv <input_jsonl> <output_csv>
-# =========================================================
-
-if __name__ == "__main__":
-    import sys
-
-    args = sys.argv[1:]
-    if not args:
-        print(
-            "Usage:\n"
-            "  python -m app.core.preprocess count <input_jsonl> [cutoff_year]\n"
-            "  python -m app.core.preprocess filter <input_jsonl> <output_jsonl> [cutoff_year]\n"
-            "  python -m app.core.preprocess tocsv <input_jsonl> <output_csv>\n"
-        )
-        sys.exit(0)
-
-    cmd = args[0].lower()
-
-    if cmd == "count":
-        if len(args) < 2:
-            print("count <input_jsonl> [cutoff_year]")
-            sys.exit(1)
-        input_path = args[1]
-        cutoff = int(args[2]) if len(args) >= 3 else 2025
-        n = count_until_year_from_path(input_path, cutoff)
-        # 원문 출력 메시지 형식 맞춤
-        print(f"✅ {cutoff-1}년까지의 논문 수: {n}")
-
-    elif cmd == "filter":
-        if len(args) < 3:
-            print("filter <input_jsonl> <output_jsonl> [cutoff_year]")
-            sys.exit(1)
-        input_path = args[1]
-        output_path = args[2]
-        cutoff = int(args[3]) if len(args) >= 4 else 2025
-        saved = filter_jsonl_to_jsonl_with_cutoff(input_path, output_path, cutoff_year=cutoff, log_errors=True)
-        print(f"✅ 필터링 완료: {saved}개의 논문이 저장됨")
-
-    elif cmd == "tocsv":
-        if len(args) < 3:
-            print("tocsv <input_jsonl> <output_csv>")
-            sys.exit(1)
-        input_path = args[1]
-        output_csv = args[2]
-        rows, path_out = jsonl_to_csv(input_path, output_csv)
-        print(f"✅ CSV 저장 완료: {rows}행 → {path_out}")
-
-    else:
-        print(f"Unknown command: {cmd}")
-        sys.exit(1)
