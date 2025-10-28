@@ -202,6 +202,8 @@ async def run_pipeline(
                 ensure_ascii=False,
             ) + "\n"
 
+            print(f"✅ 전처리 시작: {len(df):,}개의 데이터")
+
             # 2) 연도 필터링
             yield json.dumps({"step": "데이터 필터링 시작", "progress": 15}, ensure_ascii=False) + "\n"
             df_year = await asyncio.to_thread(filter_df_before_year, df, int(cutoff_year))
