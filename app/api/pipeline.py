@@ -14,7 +14,7 @@ import pandas as pd
 from fastapi import APIRouter, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 
-from app.core.preprocess import run_preprocess, filter_df_before_year
+from app.core.preprocess import run_preprocess, filter_df_before_year, get_cpc_path
 from app.core.embedding import run_embedding
 from app.core.clustering import run_clustering
 from app.core.tech_naming import run_tech_naming
@@ -202,13 +202,19 @@ async def run_pipeline(
                 ensure_ascii=False,
             ) + "\n"
 
-            # 2) 전처리
-            yield json.dumps({"step": "데이터 전처리 시작", "progress": 15}, ensure_ascii=False) + "\n"
-            df_clean = await asyncio.to_thread(run_preprocess, df, int(cutoff_year))
+            # 2) 연도 필터링
+            yield json.dumps({"step": "데이터 필터링 시작", "progress": 15}, ensure_ascii=False) + "\n"
+            df_year = await asyncio.to_thread(filter_df_before_year, df, int(cutoff_year))
 
-            # 3) 연도 필터
-            yield json.dumps({"step": "데이터 필터링 시작", "progress": 25}, ensure_ascii=False) + "\n"
-            df_filtered = await asyncio.to_thread(filter_df_before_year, df_clean, int(cutoff_year))
+            # 3) 전처리
+            yield json.dumps({"step": "데이터 전처리 시작", "progress": 20}, ensure_ascii=False) + "\n"
+            df_clean = await asyncio.to_thread(
+                run_preprocess,
+                df_year,
+                int(cutoff_year),
+                do_cpc_match=True,
+                cpc_csv_path=get_cpc_path(),
+            )
 
             # 4) 임베딩 (하트비트 포함)
             yield json.dumps({"step": "임베딩 중", "progress": 40}, ensure_ascii=False) + "\n"
@@ -227,7 +233,7 @@ async def run_pipeline(
             # 임베딩 실행
             task_embed = asyncio.create_task(asyncio.to_thread(
                 run_embedding,
-                df_filtered,
+                df_clean,
                 model_name,
                 # 체크포인트 사용 시 재개 가능 (문제 있으면 resume=False 권장)
                 batch_size=512,
