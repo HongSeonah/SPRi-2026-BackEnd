@@ -4,6 +4,7 @@ import io
 import os
 import csv
 import json
+import traceback
 import uuid
 import tempfile
 from pathlib import Path
@@ -183,33 +184,39 @@ async def run_pipeline(
     rid = run_id or uuid.uuid4().hex
     temp_paths: list[Path] = []
 
+    def j(obj):
+        """JSON 한 줄 스트림 포맷"""
+        return json.dumps(obj, ensure_ascii=False) + "\n"
+
     async def stream():
         try:
             # 0) 업로드 → 임시파일
-            yield json.dumps({"step": "파일 저장 시작", "progress": 0}, ensure_ascii=False) + "\n"
+            yield j({"step": "파일 저장 시작", "progress": 0})
             src_path = await _save_upload_to_tempfile(file)
             temp_paths.append(src_path)
-            yield json.dumps(
-                {"step": "파일 저장 완료", "progress": 4, "meta": {"path": str(src_path), "filename": file.filename}},
-                ensure_ascii=False,
-            ) + "\n"
+            yield j({
+                "step": "파일 저장 완료",
+                "progress": 4,
+                "meta": {"path": str(src_path), "filename": file.filename}
+            })
 
             # 1) 파일 로드
-            yield json.dumps({"step": "파일 로드 중", "progress": 5}, ensure_ascii=False) + "\n"
+            yield j({"step": "파일 로드 중", "progress": 5})
             df, meta = await asyncio.to_thread(_load_table_from_path, src_path, True)
-            yield json.dumps(
-                {"step": "파일 로드 완료", "progress": 10, "meta": {"filename": file.filename, **meta}},
-                ensure_ascii=False,
-            ) + "\n"
-
+            yield j({
+                "step": "파일 로드 완료",
+                "progress": 10,
+                "meta": {"filename": file.filename, **meta}
+            })
             print(f"✅ 전처리 시작: {len(df):,}개의 데이터")
 
             # 2) 연도 필터링
-            yield json.dumps({"step": "데이터 필터링 시작", "progress": 15}, ensure_ascii=False) + "\n"
+            yield j({"step": "데이터 연도 필터링 시작", "progress": 15})
             df_year = await asyncio.to_thread(filter_df_before_year, df, int(cutoff_year))
+            print(f"✅ 연도 필터링 완료: {len(df_year):,}개의 데이터")
 
             # 3) 전처리
-            yield json.dumps({"step": "데이터 전처리 시작", "progress": 20}, ensure_ascii=False) + "\n"
+            yield j({"step": "데이터 전처리 시작", "progress": 20})
             df_clean = await asyncio.to_thread(
                 run_preprocess,
                 df_year,
@@ -217,18 +224,15 @@ async def run_pipeline(
                 do_cpc_match=True,
                 cpc_csv_path=get_cpc_path(),
             )
-
             print(f"✅ 전처리 완료: {len(df_clean):,}개의 데이터")
 
             # 4) 임베딩 (하트비트 포함)
-            yield json.dumps({"step": "임베딩 중", "progress": 40}, ensure_ascii=False) + "\n"
-
+            yield j({"step": "임베딩 중", "progress": 40})
             progress_q: asyncio.Queue = asyncio.Queue()
             loop = asyncio.get_event_loop()
-            last_progress: Optional[tuple[int, int]] = None  # (processed, total)
+            last_progress: Optional[tuple[int, int]] = None
 
             def _progress_cb(processed: int, total: int):
-                # run_embedding은 to_thread에서 돌기 때문에, 스레드-세이프하게 이벤트루프로 넘겨야 함
                 try:
                     loop.call_soon_threadsafe(progress_q.put_nowait, (processed, total))
                 except Exception:
@@ -239,14 +243,13 @@ async def run_pipeline(
                 run_embedding,
                 df_clean,
                 model_name,
-                # 체크포인트 사용 시 재개 가능 (문제 있으면 resume=False 권장)
                 batch_size=512,
                 checkpoint_dir=f"/tmp/emb_ckpt/{rid}",
                 resume=True,
                 progress_cb=_progress_cb,
             ))
 
-            # 진행 상황 하트비트
+            # 하트비트
             HB_INTERVAL = 2
             while not task_embed.done():
                 try:
@@ -258,33 +261,38 @@ async def run_pipeline(
 
                 if last_progress is not None:
                     processed, total = last_progress
-                    pct = 40 + (processed / max(total, 1)) * 30  # 40~70
-                    yield json.dumps({
+                    pct = 40 + (processed / max(total, 1)) * 30
+                    yield j({
                         "step": "ping",
                         "progress": int(pct),
-                        "meta": {"stage": "embedding", "processed": processed, "total": total, "batch_size": 512}
-                    }, ensure_ascii=False) + "\n"
+                        "meta": {
+                            "stage": "embedding",
+                            "processed": processed,
+                            "total": total,
+                            "batch_size": 512
+                        }
+                    })
                 else:
-                    yield json.dumps({"step": "ping", "progress": 41}, ensure_ascii=False) + "\n"
+                    yield j({"step": "ping", "progress": 41})
 
-            # 임베딩 완료 결과 수집
+            # 임베딩 완료
             df_embed = await task_embed
 
             # 5) 클러스터링/요약
-            yield json.dumps({"step": "클러스터링 및 추세 분석 중", "progress": 70}, ensure_ascii=False) + "\n"
+            yield j({"step": "클러스터링 및 추세 분석 중", "progress": 70})
             df_clustered, summary = await asyncio.to_thread(run_clustering, df_embed, n_clusters)
             if not isinstance(summary, dict) or "artifacts" not in summary:
                 raise RuntimeError("artifacts 누락")
 
-            # 6) 요소기술 네이밍 (flow-agg) → OUTPUT_DIR/names_generated_flowagg.csv
-            yield json.dumps({"step": "기술명 생성 중", "progress": 85}, ensure_ascii=False) + "\n"
+            # 6) 요소기술 네이밍
+            yield j({"step": "기술명 생성 중", "progress": 85})
             naming_result = await asyncio.to_thread(
                 run_tech_naming, None, artifacts=summary["artifacts"], top_n=int(top_n)
             )
             elem_csv_path = naming_result["paths"].get("flowagg_csv", "")
 
-            # 7) 구성기술 묶기 (메모리 전용; 디스크 저장 없음)
-            yield json.dumps({"step": "구성기술 묶는 중", "progress": 90}, ensure_ascii=False) + "\n"
+            # 7) 구성기술 묶기
+            yield j({"step": "구성기술 묶는 중", "progress": 90})
             cfg = ComponentTechConfig(
                 n_components=int(n_clusters),
                 year_col="year",
@@ -294,38 +302,52 @@ async def run_pipeline(
             )
             df_component, comp_summary = await asyncio.to_thread(run_component_grouping, df_clustered, cfg)
 
-            # 8) 구성기술 네이밍(전체) → OUTPUT_DIR/component_tech_names.csv
-            yield json.dumps({"step": "구성기술 네이밍 중", "progress": 96}, ensure_ascii=False) + "\n"
+            # 8) 구성기술 네이밍
+            yield j({"step": "구성기술 네이밍 중", "progress": 96})
             comp_csv_path = await asyncio.to_thread(
                 generate_component_names_csv,
                 df_component,
                 label_col="component_tech_id",
                 text_cols=("title",),
-                output_csv_path=None,   # 내부에서 OUTPUT_DIR 사용
+                output_csv_path=None,
             )
 
-            # 9) 완료(결과 경로 전송)
+            # 9) 완료
             keywords = _to_str_list(summary.get("keywords", []))[:100]
             titles = _to_str_list(summary.get("titles", []))[:100]
-            yield json.dumps(
-                {
-                    "step": "완료",
-                    "progress": 100,
-                    "result": {
-                        "outputs": {
-                            "element_names_csv": elem_csv_path,
-                            "component_names_csv": comp_csv_path,
-                        },
-                        "summary": {"keywords": keywords, "titles": titles, "paths": summary.get("paths", {})},
-                        "run_id": rid,
+            yield j({
+                "step": "완료",
+                "progress": 100,
+                "result": {
+                    "outputs": {
+                        "element_names_csv": elem_csv_path,
+                        "component_names_csv": comp_csv_path,
                     },
+                    "summary": {
+                        "keywords": keywords,
+                        "titles": titles,
+                        "paths": summary.get("paths", {})
+                    },
+                    "run_id": rid,
                 },
-                ensure_ascii=False,
-            ) + "\n"
+            })
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            yield json.dumps({"step": "오류 발생", "progress": -1, "error": str(e)}, ensure_ascii=False) + "\n"
+            tb = traceback.format_exc()
+            print("[STREAM ERROR]", tb)
+            yield j({
+                "step": "오류 발생",
+                "progress": -1,
+                "error": str(e),
+                "traceback": tb[-1000:],
+            })
         finally:
+            try:
+                yield j({"step": "stream-close", "progress": -2})
+            except Exception:
+                pass
             # 임시파일 정리
             for p in temp_paths:
                 try:
@@ -333,8 +355,13 @@ async def run_pipeline(
                 except Exception:
                     pass
 
+    # --- Streaming Response 설정 ---
     return StreamingResponse(
         stream(),
-        media_type="application/json",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        media_type="text/event-stream",  # 🔹 스트리밍 안정성 향상
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 🔹 NGINX 버퍼링 방지
+        },
     )
