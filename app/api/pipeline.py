@@ -1,6 +1,5 @@
 # app/api/pipeline.py
 import asyncio
-import io
 import os
 import csv
 import json
@@ -10,12 +9,11 @@ import tempfile
 from pathlib import Path
 from typing import Any, Tuple, Optional
 
-import numpy as np
 import pandas as pd
 from fastapi import APIRouter, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 
-from app.core.preprocess import run_preprocess, filter_df_before_year, get_cpc_path
+from app.core.preprocess import run_preprocess, filter_df_before_year
 from app.core.embedding import run_embedding
 from app.core.clustering import run_clustering
 from app.core.tech_naming import run_tech_naming
@@ -227,16 +225,12 @@ async def run_pipeline(
                 except Exception:
                     pass
 
+            # ✅ CPC 관련 옵션 제거된 run_preprocess 호출
             task_pre = asyncio.create_task(asyncio.to_thread(
                 run_preprocess,
                 df_year,
                 int(cutoff_year),
-                do_cpc_match=True,
-                cpc_csv_path=get_cpc_path(),
-                # 필요 시 튜닝
-                # cpc_batch_size=256,
-                # cpc_threshold=0.35,
-                progress_cb=_pre_cb,  # 🔹 콜백 주입
+                progress_cb=_pre_cb,  # 콜백만 유지
             ))
 
             HB_INTERVAL = 2
@@ -393,10 +387,10 @@ async def run_pipeline(
     # --- Streaming Response 설정 ---
     return StreamingResponse(
         stream(),
-        media_type="text/event-stream",  # 🔹 스트리밍 안정성 향상
+        media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # 🔹 NGINX 버퍼링 방지
+            "X-Accel-Buffering": "no",
         },
     )

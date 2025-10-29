@@ -50,14 +50,14 @@ def _to_f32_array(x: Any) -> np.ndarray:
         if x.dtype == object:
             # 각 원소가 벡터라고 가정
             x = [np.asarray(v, dtype=np.float32) for v in x]
-            return np.vstack(x).astype(np.float32, copy=False)
+            return np.vstack(x).astype(np.float32)
         # 이미 수치형 ndarray
-        arr = np.asarray(x, dtype=np.float32, copy=False)
+        arr = np.asarray(x, dtype=np.float32)
         if arr.ndim == 1:
             arr = arr[None, :]
         return arr
     # 파이썬 리스트/튜플 등
-    arr = np.vstack([np.asarray(v, dtype=np.float32) for v in x]).astype(np.float32, copy=False)
+    arr = np.vstack([np.asarray(v, dtype=np.float32) for v in x]).astype(np.float32)
     return arr
 
 def _safe_load_part(path: Union[str, Path]) -> np.ndarray:
@@ -240,7 +240,7 @@ def run_embedding(
             dims, rows_total = None, 0
             for p in files:
                 with np.load(str(p)) as data:
-                    arr = np.asarray(data["emb"], dtype=np.float32, copy=False)
+                    arr = np.asarray(data["emb"], dtype=np.float32)
                     if arr.ndim != 2:
                         raise RuntimeError(f"invalid part shape: {p} -> {arr.shape}")
                     r, d = arr.shape
@@ -252,7 +252,7 @@ def run_embedding(
             offset = 0
             for p in files:
                 with np.load(str(p)) as data:
-                    arr = np.asarray(data["emb"], dtype=np.float32, copy=False)
+                    arr = np.asarray(data["emb"], dtype=np.float32)
                     r = arr.shape[0]
                     big[offset:offset + r, :] = arr
                     offset += r

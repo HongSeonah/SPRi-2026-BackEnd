@@ -8,7 +8,6 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 load_dotenv()  # .env 파일 로드
 
-from app.core import embedding, preprocess, clustering, tech_naming
 from app.api import pipeline
 app = FastAPI(title="Spri AI Pipeline", version="1.0")
 
