@@ -243,7 +243,7 @@ async def _save_upload_to_tempfile(file: UploadFile) -> Path:
 @router.post("/pipeline/run")
 async def run_pipeline(
     file: UploadFile = File(...),
-    cutoff_year: int = Form(2025),
+    cutoff_year: int = Form(2026),
     n_clusters: int = Form(100),
     model_name: str = Form("all-MiniLM-L6-v2"),
     top_n: int = Form(100),

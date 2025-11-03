@@ -61,7 +61,7 @@ def filter_before_year_stream_to_df(fp: IO[str], cutoff_year: int) -> pd.DataFra
 # =========================================================
 # 파일 경로 기반 I/O (원문 스크립트와 동일)
 # =========================================================
-def count_until_year_from_path(input_path: str, cutoff_year: int = 2025) -> int:
+def count_until_year_from_path(input_path: str, cutoff_year: int = 2026) -> int:
     p = Path(input_path)
     cnt = 0
     with p.open("r", encoding="utf-8") as infile:
@@ -194,7 +194,7 @@ def filter_df_by_keywords_literal(
 # =========================================================
 def run_preprocess(
     df: pd.DataFrame,
-    cutoff_year: int = 2025,
+    cutoff_year: int = 2026,
     *,
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
     **kwargs
