@@ -6,6 +6,7 @@ import json
 import traceback
 import uuid
 import tempfile
+import base64
 from pathlib import Path
 from typing import Any, Tuple, Optional
 
@@ -27,6 +28,84 @@ router = APIRouter(tags=["Pipeline"])
 # ============================================================
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/var/lib/app/outputs")).resolve()
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ===================== 진행도 트래커 =========================
+class ProgressTracker:
+    """
+    섹션(element, component)별 스텝 진행도/가중치를 통해
+      - element_progress (0~1)
+      - component_progress (0~1)
+      - overall_progress (0~1)
+    를 계산한다.
+    각 step은 [0,1] 구간의 세부 진행도를 받는다.
+    """
+
+    # 전체 진행도에서 섹션 가중치
+    ELEMENT_WEIGHT = 0.85
+    COMPONENT_WEIGHT = 0.15
+
+    # 섹션별 스텝 가중치 (합=1.0)
+    ELEMENT_STEPS = [
+        ("upload", 0.05),
+        ("load", 0.05),
+        ("year_filter", 0.10),
+        ("preprocess", 0.20),
+        ("embedding", 0.35),
+        ("clustering", 0.15),
+        ("tech_naming", 0.10),
+    ]
+    COMPONENT_STEPS = [
+        ("component_grouping", 0.40),
+        ("component_naming", 0.50),
+        ("finalize", 0.10),
+    ]
+
+    def __init__(self):
+        self._el_progress = {name: 0.0 for name, _ in self.ELEMENT_STEPS}
+        self._co_progress = {name: 0.0 for name, _ in self.COMPONENT_STEPS}
+
+        self._el_weights = {name: w for name, w in self.ELEMENT_STEPS}
+        self._co_weights = {name: w for name, w in self.COMPONENT_STEPS}
+
+    # 현재 단계(step_name)의 진행도 갱신 (0~1)
+    def update_step(self, step_name: str, frac: float):
+        frac = max(0.0, min(1.0, float(frac)))
+        if step_name in self._el_progress:
+            self._el_progress[step_name] = frac
+        elif step_name in self._co_progress:
+            self._co_progress[step_name] = frac
+
+    def _weighted_sum(self, progress_map, weight_map) -> float:
+        return sum(progress_map[s] * weight_map[s] for s in progress_map)
+
+    def element_progress(self) -> float:
+        return self._weighted_sum(self._el_progress, self._el_weights)
+
+    def component_progress(self) -> float:
+        return self._weighted_sum(self._co_progress, self._co_weights)
+
+    def overall_progress(self) -> float:
+        return (
+            self.ELEMENT_WEIGHT * self.element_progress()
+            + self.COMPONENT_WEIGHT * self.component_progress()
+        )
+
+    def pack(self, current_step: str, phase: str, step_progress: float) -> dict:
+        el = self.element_progress()
+        co = self.component_progress()
+        ov = self.overall_progress()
+        return {
+            "phase": phase,
+            "step": current_step,
+            "step_progress": int(round(step_progress * 100)),
+            "element_progress": int(round(el * 100)),
+            "component_progress": int(round(co * 100)),
+            "overall_progress": int(round(ov * 100)),
+            # 하위 호환 (기존 progress 필드)
+            "progress": int(round(ov * 100)),
+        }
+
 
 # ---------------------- 유틸: 포맷 스니핑 ----------------------
 def _looks_like_json(txt: str) -> bool:
@@ -175,12 +254,13 @@ async def run_pipeline(
       - 업로드는 임시파일에만 저장(요청 끝나면 삭제)
       - 중간 산출물도 메모리/임시파일로만 사용
       - 진행상황을 JSON 라인으로 스트리밍
-      - 결과물: OUTPUT_DIR에 CSV 2개 저장
-          * 요소기술 네이밍: names_generated_flowagg.csv
-          * 구성기술 네이밍: component_tech_names.csv
+      - 결과물: 프론트에 CSV(base64)로 직접 전달
+        * 요소기술 네이밍: names_generated_flowagg.csv
+        * 구성기술 네이밍: component_tech_names.csv
     """
     rid = run_id or uuid.uuid4().hex
     temp_paths: list[Path] = []
+    tracker = ProgressTracker()  # 진행도 트래커
 
     def j(obj):
         """JSON 한 줄 스트림 포맷"""
@@ -189,32 +269,41 @@ async def run_pipeline(
     async def stream():
         try:
             # 0) 업로드 → 임시파일
-            yield j({"step": "파일 저장 시작", "progress": 0})
+            tracker.update_step("upload", 0.0)
+            yield j({**tracker.pack("upload", "element", 0.0), "step_label": "파일 저장 시작"})
             src_path = await _save_upload_to_tempfile(file)
             temp_paths.append(src_path)
+            tracker.update_step("upload", 1.0)
             yield j({
-                "step": "파일 저장 완료",
-                "progress": 4,
+                **tracker.pack("upload", "element", 1.0),
+                "step_label": "파일 저장 완료",
                 "meta": {"path": str(src_path), "filename": file.filename}
             })
 
             # 1) 파일 로드
-            yield j({"step": "파일 로드 중", "progress": 5})
+            tracker.update_step("load", 0.0)
+            yield j({**tracker.pack("load", "element", 0.0), "step_label": "파일 로드 중"})
             df, meta = await asyncio.to_thread(_load_table_from_path, src_path, True)
+            tracker.update_step("load", 1.0)
             yield j({
-                "step": "파일 로드 완료",
-                "progress": 10,
+                **tracker.pack("load", "element", 1.0),
+                "step_label": "파일 로드 완료",
                 "meta": {"filename": file.filename, **meta}
             })
-            print(f"✅ 전처리 시작: {len(df):,}개의 데이터")
+            # print(f"✅ 전처리 시작: {len(df):,}개의 데이터")
 
             # 2) 연도 필터링
-            yield j({"step": "데이터 연도 필터링 시작", "progress": 15})
+            tracker.update_step("year_filter", 0.0)
+            yield j({**tracker.pack("year_filter", "element", 0.0), "step_label": "데이터 연도 필터링 시작"})
             df_year = await asyncio.to_thread(filter_df_before_year, df, int(cutoff_year))
-            print(f"✅ 연도 필터링 완료: {len(df_year):,}개의 데이터")
+            tracker.update_step("year_filter", 1.0)
+            yield j({**tracker.pack("year_filter", "element", 1.0), "step_label": "연도 필터링 완료",
+                     "meta": {"rows_after_filter": len(df_year)}})
+            # print(f"✅ 연도 필터링 완료: {len(df_year):,}개의 데이터")
 
             # 3) 전처리 (콜백 + 하트비트)
-            yield j({"step": "데이터 전처리 시작", "progress": 20})
+            tracker.update_step("preprocess", 0.0)
+            yield j({**tracker.pack("preprocess", "element", 0.0), "step_label": "데이터 전처리 시작"})
 
             pre_q: asyncio.Queue = asyncio.Queue()
             loop = asyncio.get_event_loop()
@@ -245,18 +334,28 @@ async def run_pipeline(
 
                 if last_pre is not None:
                     proc, tot, stage = last_pre
-                    pct = 20 + (proc / max(tot, 1)) * 20  # 20~40% 구간
-                    yield j({"step": "ping", "progress": int(pct),
-                             "meta": {"stage": stage, "processed": proc, "total": tot}})
+                    frac = (proc / max(tot, 1))
+                    tracker.update_step("preprocess", frac)
+                    yield j({
+                        **tracker.pack("preprocess", "element", frac),
+                        "step_label": "데이터 전처리 진행 중",
+                        "meta": {"stage": stage, "processed": proc, "total": tot}
+                    })
                 else:
-                    yield j({"step": "ping", "progress": 21, "meta": {"stage": "preprocess_idle"}})
+                    # 하트비트
+                    yield j({**tracker.pack("preprocess", "element", tracker._el_progress["preprocess"]),
+                             "step_label": "데이터 전처리 하트비트", "meta": {"stage": "preprocess_idle"}})
 
             df_clean = await task_pre
-            print(f"✅ 전처리 완료: {len(df_clean):,}개의 데이터")
-            yield j({"step": "데이터 전처리 완료", "progress": 40, "meta": {"rows": len(df_clean)}})
+            tracker.update_step("preprocess", 1.0)
+            yield j({**tracker.pack("preprocess", "element", 1.0),
+                     "step_label": "데이터 전처리 완료",
+                     "meta": {"rows": len(df_clean)}})
+            # print(f"✅ 전처리 완료: {len(df_clean):,}개의 데이터")
 
             # 4) 임베딩 (하트비트 포함)
-            yield j({"step": "임베딩 중", "progress": 40})
+            tracker.update_step("embedding", 0.0)
+            yield j({**tracker.pack("embedding", "element", 0.0), "step_label": "임베딩 시작"})
             progress_q: asyncio.Queue = asyncio.Queue()
             loop = asyncio.get_event_loop()
             last_progress: Optional[tuple[int, int]] = None
@@ -290,10 +389,11 @@ async def run_pipeline(
 
                 if last_progress is not None:
                     processed, total = last_progress
-                    pct = 40 + (processed / max(total, 1)) * 30
+                    frac = (processed / max(total, 1))
+                    tracker.update_step("embedding", frac)
                     yield j({
-                        "step": "ping",
-                        "progress": int(pct),
+                        **tracker.pack("embedding", "element", frac),
+                        "step_label": "임베딩 진행 중",
                         "meta": {
                             "stage": "embedding",
                             "processed": processed,
@@ -302,26 +402,39 @@ async def run_pipeline(
                         }
                     })
                 else:
-                    yield j({"step": "ping", "progress": 41})
+                    yield j({**tracker.pack("embedding", "element", tracker._el_progress["embedding"]),
+                             "step_label": "임베딩 하트비트"})
 
             # 임베딩 완료
             df_embed = await task_embed
+            tracker.update_step("embedding", 1.0)
+            yield j({**tracker.pack("embedding", "element", 1.0), "step_label": "임베딩 완료"})
 
             # 5) 클러스터링/요약
-            yield j({"step": "클러스터링 및 추세 분석 중", "progress": 70})
+            tracker.update_step("clustering", 0.0)
+            yield j({**tracker.pack("clustering", "element", 0.0), "step_label": "클러스터링 및 추세 분석 시작"})
+            # (여기선 내부 진행 콜백이 없으므로 단계 단위로 0→1 처리)
             df_clustered, summary = await asyncio.to_thread(run_clustering, df_embed, n_clusters)
             if not isinstance(summary, dict) or "artifacts" not in summary:
                 raise RuntimeError("artifacts 누락")
+            tracker.update_step("clustering", 1.0)
+            yield j({**tracker.pack("clustering", "element", 1.0), "step_label": "클러스터링 및 추세 분석 완료"})
 
             # 6) 요소기술 네이밍
-            yield j({"step": "기술명 생성 중", "progress": 85})
+            tracker.update_step("tech_naming", 0.0)
+            yield j({**tracker.pack("tech_naming", "element", 0.0), "step_label": "요소기술 네이밍 시작"})
+            # (동기 함수라 하트비트 없음 → 시작/완료로 표기)
             naming_result = await asyncio.to_thread(
                 run_tech_naming, None, artifacts=summary["artifacts"], top_n=int(top_n)
             )
-            elem_csv_path = naming_result["paths"].get("flowagg_csv", "")
+            elem_csv_text: str = naming_result.get("csv_text", "")
+            tracker.update_step("tech_naming", 1.0)
+            yield j({**tracker.pack("tech_naming", "element", 1.0), "step_label": "요소기술 네이밍 완료"})
 
+            # -------- 여기부터 구성기술 섹션 --------
             # 7) 구성기술 묶기
-            yield j({"step": "구성기술 묶는 중", "progress": 90})
+            tracker.update_step("component_grouping", 0.0)
+            yield j({**tracker.pack("component_grouping", "component", 0.0), "step_label": "구성기술 묶는 중 시작"})
             cfg = ComponentTechConfig(
                 n_components=int(n_clusters),
                 year_col="year",
@@ -330,27 +443,63 @@ async def run_pipeline(
                 random_state=42,
             )
             df_component, comp_summary = await asyncio.to_thread(run_component_grouping, df_clustered, cfg)
+            tracker.update_step("component_grouping", 1.0)
+            yield j({**tracker.pack("component_grouping", "component", 1.0),
+                     "step_label": "구성기술 묶기 완료"})
 
             # 8) 구성기술 네이밍
-            yield j({"step": "구성기술 네이밍 중", "progress": 96})
-            comp_csv_path = await asyncio.to_thread(
+            tracker.update_step("component_naming", 0.0)
+            yield j({**tracker.pack("component_naming", "component", 0.0), "step_label": "구성기술 네이밍 시작"})
+            comp_csv_text: str = await asyncio.to_thread(
                 generate_component_names_csv,
                 df_component,
                 label_col="component_tech_id",
                 text_cols=("title",),
                 output_csv_path=None,
             )
+            tracker.update_step("component_naming", 1.0)
+            yield j({**tracker.pack("component_naming", "component", 1.0), "step_label": "구성기술 네이밍 완료"})
+
+            # (참고) 저장 로직은 더 이상 사용하지 않지만, 혹시 복구할 수 있도록 주석으로 남겨둡니다.
+            # -----------------------------------------------------------------------
+            # elem_csv_path = OUTPUT_DIR / "names_generated_flowagg.csv"
+            # (OUTPUT_DIR / "names_generated_flowagg.csv").write_text(elem_csv_text, encoding="utf-8-sig")
+            # comp_csv_path = OUTPUT_DIR / "component_tech_names.csv"
+            # (OUTPUT_DIR / "component_tech_names.csv").write_text(comp_csv_text, encoding="utf-8-sig")
+            # -----------------------------------------------------------------------
+
+            # 8.5) CSV 텍스트 → base64 (바이너리 안전)
+            def _b64(text: str) -> str:
+                if text is None:
+                    return ""
+                return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+            elem_csv_b64 = _b64(elem_csv_text)
+            comp_csv_b64 = _b64(comp_csv_text)
 
             # 9) 완료
+            tracker.update_step("finalize", 1.0)
             keywords = _to_str_list(summary.get("keywords", []))[:100]
             titles = _to_str_list(summary.get("titles", []))[:100]
             yield j({
-                "step": "완료",
-                "progress": 100,
+                **tracker.pack("finalize", "component", 1.0),
+                "step_label": "파이프라인 완료",
                 "result": {
                     "outputs": {
-                        "element_names_csv": elem_csv_path,
-                        "component_names_csv": comp_csv_path,
+                        "files": [
+                            {
+                                "filename": "names_generated_flowagg.csv",
+                                "mime": "text/csv; charset=utf-8",
+                                "encoding": "base64",
+                                "content": elem_csv_b64
+                            },
+                            {
+                                "filename": "component_tech_names.csv",
+                                "mime": "text/csv; charset=utf-8",
+                                "encoding": "base64",
+                                "content": comp_csv_b64
+                            }
+                        ]
                     },
                     "summary": {
                         "keywords": keywords,
@@ -366,15 +515,18 @@ async def run_pipeline(
         except Exception as e:
             tb = traceback.format_exc()
             print("[STREAM ERROR]", tb)
+            # 오류 시에도 그 시점의 진행도를 포함
             yield j({
-                "step": "오류 발생",
-                "progress": -1,
+                **tracker.pack("error", "element", 0.0),
+                "step_label": "오류 발생",
+                "progress": -1,  # 하위 호환
                 "error": str(e),
                 "traceback": tb[-1000:],
             })
         finally:
             try:
-                yield j({"step": "stream-close", "progress": -2})
+                yield j({**tracker.pack("stream-close", "component", 1.0),
+                         "step_label": "stream-close", "progress": -2})
             except Exception:
                 pass
             # 임시파일 정리

@@ -3,7 +3,7 @@
 #  기술 네이밍 생성기 (Flow-Aggregated)
 #  - OpenAI 호출 병렬화로 처리시간 단축 → 프록시/서버 타임아웃 리스크 완화
 #  - 재시도: 지수 백오프 + 지터, 429/5xx 내성 강화
-#  - 최종 네이밍 CSV만 OUTPUT_DIR에 저장
+#  - 최종 네이밍 결과를 DataFrame/CSV 텍스트로 반환 (저장 로직은 주석 처리)
 #  - 주요 튜닝 ENV:
 #     * OUTPUT_DIR       (기본: /var/lib/app/outputs)
 #     * LABEL_SUFFIX     (메타)
@@ -27,8 +27,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 OUTPUT_DIR   = Path(os.getenv("OUTPUT_DIR", "/var/lib/app/outputs")).resolve()
 LABEL_SUFFIX = os.getenv("LABEL_SUFFIX", "k100")   # 메타 표기용
 METHOD       = os.getenv("METHOD", "A").upper().strip()
-OUT_HYBRID   = OUTPUT_DIR / "names_generated_hybrid.csv"
-OUT_FLOWAG   = OUTPUT_DIR / "names_generated_flowagg.csv"
+OUT_HYBRID   = OUTPUT_DIR / "names_generated_hybrid.csv"   # (미사용: 호환 위해 남김)
+OUT_FLOWAG   = OUTPUT_DIR / "names_generated_flowagg.csv"  # (미사용: 호환 위해 남김)
 
 # 튜닝 파라미터
 MAX_WORKERS       = max(1, int(os.getenv("MAX_WORKERS", "4")))
@@ -212,13 +212,6 @@ def _rep_titles_via_embeddings(df_c: pd.DataFrame, n:int=3) -> List[str]:
 TOPK_KEYWORDS = 40
 N_REP_TITLES  = 3
 
-# SYS_HYBRID = (
-#     "당신은 기술 네이밍 비서입니다. 입력된 클러스터의 키워드와 대표 타이틀을 보고 "
-#     "① 목적, ② 구현 방법, ③ 신규 기여를 간결히 요약하고, 한국어/영문 기술명을 JSON으로만 출력하세요.\n"
-#     "반드시 아래 키를 포함한 JSON만 출력하세요:\n"
-#     '{"tech_name_ko":"","tech_name_en":"","purpose":"","method":"","novelty":"","rationale":""}'
-# )
-
 SYS_FLOWAG = (
     "당신은 기술 네이밍 비서입니다. 입력된 클러스터의 키워드와 대표 타이틀을 보고 "
     "① 기술의 '목적', ② '구현 방법', ③ '신규 기여'를 간결히 도출한 다음, "
@@ -257,8 +250,9 @@ def _as_completed_results(futures):
             # 호출 단에서 메시지로 변환해 반환하도록 함
             yield {"status": f"error: {type(e).__name__}: {e}"}
 
-def _run_flowagg(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[str, Any]) -> Path:
-    rows_out = []
+def _run_flowagg(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[str, Any]) -> pd.DataFrame:
+    """flow-aggregated 네이밍을 실행해 DataFrame을 반환 (파일 저장 없음)."""
+    rows_out: List[Dict[str, Any]] = []
 
     def _task(fid: int):
         sub = panel[panel["flow_id"]==fid].sort_values("year")
@@ -291,15 +285,16 @@ def _run_flowagg(panel: pd.DataFrame, target_flows: List[int], artifacts: Dict[s
         except Exception as e:
             return {"flow_id": fid, "status": f"error: {type(e).__name__}: {e}"}
 
+    from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = [ex.submit(_task, int(fid)) for fid in target_flows]
         for res in _as_completed_results(futures):
             rows_out.append(res)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows_out).to_csv(OUT_FLOWAG, index=False, encoding="utf-8-sig")
-    return OUT_FLOWAG
-
+    # (참고) 이전 버전은 파일로 저장했으나 지금은 반환만 합니다.
+    # OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # pd.DataFrame(rows_out).to_csv(OUT_FLOWAG, index=False, encoding="utf-8-sig")
+    return pd.DataFrame(rows_out)
 
 #################################################################################
 ################################# top_n 지정 부분 #################################
@@ -331,20 +326,25 @@ def run_tech_naming(_prompt_ignored: str | None = None, *,
 
     top_flows = _select_top_flows(panel, n=top_n)
 
-    # 3) 플로우집계 네이밍만 실행 (최종 결과만 저장)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # 3) 플로우집계 네이밍 실행
+    df_out = _run_flowagg(panel, top_flows, artifacts)
+    csv_text = df_out.to_csv(index=False, encoding="utf-8-sig")
 
-    paths = {
-        "flowagg_csv": str(_run_flowagg(panel, top_flows, artifacts))
+    # (참고) 파일 저장은 비활성화 (주석 처리)
+    # OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # (OUTPUT_DIR / "names_generated_flowagg.csv").write_text(csv_text, encoding="utf-8-sig")
+
+    return {
+        "df": df_out,
+        "csv_text": csv_text,
+        "meta": {
+            "top_n": top_n,
+            "max_workers": MAX_WORKERS,
+            "request_timeout_s": REQUEST_TIMEOUT_S,
+            "retry": GPT_RETRY,
+            "backoff_base": BACKOFF_BASE,
+            "method": "F",
+            "label_suffix": LABEL_SUFFIX,
+            "model": OPENAI_MODEL,
+        }
     }
-
-    return {"paths": paths, "meta": {
-        "top_n": top_n,
-        "max_workers": MAX_WORKERS,
-        "request_timeout_s": REQUEST_TIMEOUT_S,
-        "retry": GPT_RETRY,
-        "backoff_base": BACKOFF_BASE,
-        "method": "F",
-        "label_suffix": LABEL_SUFFIX,
-        "model": OPENAI_MODEL,
-    }}

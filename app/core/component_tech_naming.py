@@ -53,8 +53,8 @@ def generate_component_names_csv(
     output_csv_path: str | Path | None = None,
 ) -> str:
     """
-    구성기술(= component_tech_id) '전체'에 대해 네이밍을 수행하고 CSV로 저장.
-    반환: 출력 CSV 절대경로 (OUTPUT_DIR/component_tech_names.csv 기본)
+    구성기술(= component_tech_id) '전체'에 대해 네이밍을 수행하고 CSV 텍스트로 반환.
+    (이전 버전의 파일 저장 로직은 주석으로 보존)
     """
     # 1) 연도 0으로 통일
     df0 = df_with_component.copy()
@@ -81,13 +81,8 @@ def generate_component_names_csv(
     # 5) 대상 flow 전부 (정렬은 보기 편하게 문서수 내림차순)
     target_flows = comp_counts.sort_values("docs", ascending=False)[label_col].astype(int).tolist()
 
-    # 6) 네이밍 실행 → CSV 정규화 저장
-    out_dir = Path(os.getenv("OUTPUT_DIR", "/var/lib/app/outputs")).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_csv = Path(output_csv_path) if output_csv_path else (out_dir / "component_tech_names.csv")
-
-    tmp_csv = _run_flowagg(panel, target_flows, artifacts)  # 기존 엔진이 만든 CSV
-    df_names = pd.read_csv(tmp_csv)
+    # 6) 네이밍 실행 → DataFrame (파일 저장 없음)
+    df_names = _run_flowagg(panel, target_flows, artifacts)
 
     # flow_id -> component_tech_id 로 컬럼 리네임
     rename_map = {"flow_id": label_col}
@@ -96,5 +91,14 @@ def generate_component_names_csv(
             rename_map.pop(k, None)
     df_out = df_names.rename(columns=rename_map)
 
-    df_out.to_csv(out_csv, index=False, encoding="utf-8-sig")
-    return str(out_csv.resolve())
+    csv_text = df_out.to_csv(index=False, encoding="utf-8-sig")
+
+    # (참고) 파일 저장 로직 보존(주석)
+    # out_dir = Path(os.getenv("OUTPUT_DIR", "/var/lib/app/outputs")).resolve()
+    # out_dir.mkdir(parents=True, exist_ok=True)
+    # out_csv = Path(output_csv_path) if output_csv_path else (out_dir / "component_tech_names.csv")
+    # out_csv.write_text(csv_text, encoding="utf-8-sig")
+    # return str(out_csv.resolve())
+
+    # 현재는 CSV 텍스트를 반환
+    return csv_text
