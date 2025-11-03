@@ -7,6 +7,7 @@ import traceback
 import uuid
 import tempfile
 import base64
+import io
 from pathlib import Path
 from typing import Any, Tuple, Optional
 
@@ -295,7 +296,6 @@ async def run_pipeline(
                 "step_label": "파일 로드 완료",
                 "meta": {"filename": file.filename, **meta}
             })
-            # print(f"✅ 전처리 시작: {len(df):,}개의 데이터")
 
             # 2) 연도 필터링
             tracker.update_step("year_filter", 0.0)
@@ -304,7 +304,6 @@ async def run_pipeline(
             tracker.update_step("year_filter", 1.0)
             yield j({**tracker.pack("year_filter", "element", 1.0), "step_label": "연도 필터링 완료",
                      "meta": {"rows_after_filter": len(df_year)}})
-            # print(f"✅ 연도 필터링 완료: {len(df_year):,}개의 데이터")
 
             # 3) 전처리 (콜백 + 하트비트)
             tracker.update_step("preprocess", 0.0)
@@ -354,7 +353,6 @@ async def run_pipeline(
             yield j({**tracker.pack("preprocess", "element", 1.0),
                      "step_label": "데이터 전처리 완료",
                      "meta": {"rows": len(df_clean)}})
-            # print(f"✅ 전처리 완료: {len(df_clean):,}개의 데이터")
 
             # 4) 임베딩 (하트비트 포함)
             tracker.update_step("embedding", 0.0)
@@ -427,12 +425,37 @@ async def run_pipeline(
                 run_tech_naming, None, artifacts=summary["artifacts"], top_n=int(top_n)
             )
             elem_csv_text: str = naming_result.get("csv_text", "")
+            naming_df: pd.DataFrame = naming_result.get("df", pd.DataFrame())
             tracker.update_step("tech_naming", 1.0)
             yield j({**tracker.pack("tech_naming", "element", 1.0), "step_label": "요소기술 네이밍 완료"})
 
-            # 요소기술 CSV 즉시 전송 (partial)
+            # 요소기술 CSV 즉시 전송 (partial) + 영문/한글 타이틀 10개씩
             elem_csv_b64 = _b64(elem_csv_text)
-            element_titles_top10 = _to_str_list(summary.get("titles", []))[:10]
+
+            elem_titles_en10, elem_titles_ko10 = [], []
+            if not naming_df.empty:
+                if "tech_name_en" in naming_df.columns:
+                    elem_titles_en10 = (
+                        naming_df["tech_name_en"]
+                        .fillna("")
+                        .astype(str)
+                        .map(str.strip)
+                        .replace("", pd.NA)
+                        .dropna()
+                        .head(10)
+                        .tolist()
+                    )
+                if "tech_name_ko" in naming_df.columns:
+                    elem_titles_ko10 = (
+                        naming_df["tech_name_ko"]
+                        .fillna("")
+                        .astype(str)
+                        .map(str.strip)
+                        .replace("", pd.NA)
+                        .dropna()
+                        .head(10)
+                        .tolist()
+                    )
 
             yield j({
                 **tracker.pack("tech_naming", "element", 1.0),
@@ -450,7 +473,8 @@ async def run_pipeline(
                         ]
                     },
                     "summary": {
-                        "titles": element_titles_top10
+                        "titles_en": elem_titles_en10,
+                        "titles_ko": elem_titles_ko10
                     },
                     "run_id": rid,
                 },
@@ -485,31 +509,35 @@ async def run_pipeline(
             tracker.update_step("component_naming", 1.0)
             yield j({**tracker.pack("component_naming", "component", 1.0), "step_label": "구성기술 네이밍 완료"})
 
-            # (참고) 저장 로직은 더 이상 사용하지 않지만, 혹시 복구할 수 있도록 주석으로 남겨둡니다.
-            # -----------------------------------------------------------------------
-            # (OUTPUT_DIR / "names_generated_flowagg.csv").write_text(elem_csv_text, encoding="utf-8-sig")
-            # (OUTPUT_DIR / "component_tech_names.csv").write_text(comp_csv_text, encoding="utf-8-sig")
-            # -----------------------------------------------------------------------
-
-            # 구성기술 타이틀 Top10: comp_summary에 있으면 우선 사용, 없으면 df_component.title에서 폴백
-            comp_titles_raw = []
-            if isinstance(comp_summary, dict):
-                comp_titles_raw = comp_summary.get("titles", [])
-
-            if comp_titles_raw:
-                component_titles_top10 = _to_str_list(comp_titles_raw)[:10]
-            else:
-                if "title" in df_component.columns:
-                    component_titles_top10 = (
-                        df_component["title"]
-                        .dropna()
-                        .astype(str)
-                        .value_counts()
-                        .index
-                        .tolist()[:10]
-                    )
-                else:
-                    component_titles_top10 = []
+            # 구성기술 타이틀: CSV 파싱해서 영문/한글 각각 10개
+            comp_titles_en10, comp_titles_ko10 = [], []
+            try:
+                comp_df = pd.read_csv(io.StringIO(comp_csv_text))
+                if not comp_df.empty:
+                    if "tech_name_en" in comp_df.columns:
+                        comp_titles_en10 = (
+                            comp_df["tech_name_en"]
+                            .fillna("")
+                            .astype(str)
+                            .map(str.strip)
+                            .replace("", pd.NA)
+                            .dropna()
+                            .head(10)
+                            .tolist()
+                        )
+                    if "tech_name_ko" in comp_df.columns:
+                        comp_titles_ko10 = (
+                            comp_df["tech_name_ko"]
+                            .fillna("")
+                            .astype(str)
+                            .map(str.strip)
+                            .replace("", pd.NA)
+                            .dropna()
+                            .head(10)
+                            .tolist()
+                        )
+            except Exception:
+                comp_titles_en10, comp_titles_ko10 = [], []
 
             # 9) 최종 완료: 구성기술 CSV 전송
             comp_csv_b64 = _b64(comp_csv_text)
@@ -529,7 +557,8 @@ async def run_pipeline(
                         ]
                     },
                     "summary": {
-                        "titles": component_titles_top10
+                        "titles_en": comp_titles_en10,
+                        "titles_ko": comp_titles_ko10
                     },
                     "run_id": rid,
                 },
