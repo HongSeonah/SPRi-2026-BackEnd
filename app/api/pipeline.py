@@ -9,7 +9,7 @@ import tempfile
 import base64
 import io
 from pathlib import Path
-from typing import Any, Tuple, Optional
+from typing import Any, Tuple, Optional, List
 
 import pandas as pd
 from fastapi import APIRouter, UploadFile, File, Form
@@ -18,7 +18,7 @@ from fastapi.responses import StreamingResponse
 from app.core.preprocess import run_preprocess, filter_df_before_year
 from app.core.embedding import run_embedding
 from app.core.clustering import run_clustering
-from app.core.tech_naming import run_tech_naming
+from app.core.tech_naming import run_tech_naming, _panel_from_artifacts_edges
 from app.core.component_tech_grouper import run_component_grouping, ComponentTechConfig
 from app.core.component_tech_naming import generate_component_names_csv
 
@@ -56,18 +56,21 @@ class ProgressTracker:
         ("clustering", 0.15),
         ("tech_naming", 0.10),
     ]
+    # 구성기술은 결과 전송(component_result)와 시각화(visualize)를 분리
     COMPONENT_STEPS = [
-        ("component_grouping", 0.40),
-        ("component_naming", 0.50),
-        ("finalize", 0.10),
+        ("component_grouping", 0.30),
+        ("component_naming", 0.30),
+        ("component_result", 0.10),
+        ("visualize", 0.30),
     ]
 
     def __init__(self):
         self._el_progress = {name: 0.0 for name, _ in self.ELEMENT_STEPS}
         self._co_progress = {name: 0.0 for name, _ in self.COMPONENT_STEPS}
 
-        self._el_weights = {name: w for name, w in self.ELEMENT_STEPS}
-        self._co_weights = {name: w for name, w in self.COMPONENT_STEPS}
+        # BUGFIX: 실제 weight 변수 사용
+        self._el_weights = {name: weight for name, weight in self.ELEMENT_STEPS}
+        self._co_weights = {name: weight for name, weight in self.COMPONENT_STEPS}
 
     # 현재 단계(step_name)의 진행도 갱신 (0~1)
     def update_step(self, step_name: str, frac: float):
@@ -203,18 +206,6 @@ def _load_table_from_path(
     meta.update({"format": "csv", "sep": sep_guess, "engine": "python", "on_bad_lines": "skip"})
     return df, meta
 
-# ---------------------- 안전 리스트 변환 ----------------------
-def _to_str_list(x: Any) -> list[str]:
-    if x is None:
-        return []
-    if isinstance(x, (list, tuple)):
-        return [str(v) for v in x]
-    if isinstance(x, pd.Series):
-        return x.dropna().astype(str).tolist()
-    if isinstance(x, pd.DataFrame):
-        return x.astype(str).stack().tolist()
-    return [str(x)]
-
 # ---------------------- base64 유틸 ----------------------
 def _b64(text: str | None) -> str:
     if not text:
@@ -257,12 +248,10 @@ async def run_pipeline(
     run_id: str = Form(None),
 ):
     """
-    영구 저장 없이 처리:
-      - 업로드는 임시파일에만 저장(요청 끝나면 삭제)
-      - 중간 산출물도 메모리/임시파일로만 사용
-      - 진행상황을 JSON 라인으로 스트리밍
-      - 결과물: 요소기술 CSV는 '준비 즉시' 먼저 전송, 최종에 구성기술 CSV 전송
-      - summary는 각 시점의 titles 상위 10개만 포함
+    스트림 순서:
+      ① element_result  : 요소기술 CSV + titles_en/titles_ko(10)
+      ② component_result: 구성기술 CSV + titles_en/titles_ko(10)
+      ③ visualize       : 계보도 데이터(components/elements/edges)
     """
     rid = run_id or uuid.uuid4().hex
     temp_paths: list[Path] = []
@@ -418,7 +407,7 @@ async def run_pipeline(
             tracker.update_step("clustering", 1.0)
             yield j({**tracker.pack("clustering", "element", 1.0), "step_label": "클러스터링 및 추세 분석 완료"})
 
-            # 6) 요소기술 네이밍 → 완료 즉시 파일 송신 (partial result)
+            # 6) 요소기술 네이밍 → 완료 즉시 파일/타이틀 송신
             tracker.update_step("tech_naming", 0.0)
             yield j({**tracker.pack("tech_naming", "element", 0.0), "step_label": "요소기술 네이밍 시작"})
             naming_result = await asyncio.to_thread(
@@ -427,36 +416,21 @@ async def run_pipeline(
             elem_csv_text: str = naming_result.get("csv_text", "")
             naming_df: pd.DataFrame = naming_result.get("df", pd.DataFrame())
             tracker.update_step("tech_naming", 1.0)
-            yield j({**tracker.pack("tech_naming", "element", 1.0), "step_label": "요소기술 네이밍 완료"})
 
-            # 요소기술 CSV 즉시 전송 (partial) + 영문/한글 타이틀 10개씩
             elem_csv_b64 = _b64(elem_csv_text)
-
-            elem_titles_en10, elem_titles_ko10 = [], []
+            elem_titles_en10: List[str] = []
+            elem_titles_ko10: List[str] = []
             if not naming_df.empty:
                 if "tech_name_en" in naming_df.columns:
                     elem_titles_en10 = (
-                        naming_df["tech_name_en"]
-                        .fillna("")
-                        .astype(str)
-                        .map(str.strip)
-                        .replace("", pd.NA)
-                        .dropna()
-                        .head(10)
-                        .tolist()
+                        naming_df["tech_name_en"].fillna("").astype(str).map(str.strip).replace("", pd.NA).dropna().head(10).tolist()
                     )
                 if "tech_name_ko" in naming_df.columns:
                     elem_titles_ko10 = (
-                        naming_df["tech_name_ko"]
-                        .fillna("")
-                        .astype(str)
-                        .map(str.strip)
-                        .replace("", pd.NA)
-                        .dropna()
-                        .head(10)
-                        .tolist()
+                        naming_df["tech_name_ko"].fillna("").astype(str).map(str.strip).replace("", pd.NA).dropna().head(10).tolist()
                     )
 
+            # ① 요소기술 결과 이벤트
             yield j({
                 **tracker.pack("tech_naming", "element", 1.0),
                 "step_label": "요소기술 결과 전송",
@@ -509,42 +483,27 @@ async def run_pipeline(
             tracker.update_step("component_naming", 1.0)
             yield j({**tracker.pack("component_naming", "component", 1.0), "step_label": "구성기술 네이밍 완료"})
 
-            # 구성기술 타이틀: CSV 파싱해서 영문/한글 각각 10개
-            comp_titles_en10, comp_titles_ko10 = [], []
-            try:
-                comp_df = pd.read_csv(io.StringIO(comp_csv_text))
-                if not comp_df.empty:
-                    if "tech_name_en" in comp_df.columns:
-                        comp_titles_en10 = (
-                            comp_df["tech_name_en"]
-                            .fillna("")
-                            .astype(str)
-                            .map(str.strip)
-                            .replace("", pd.NA)
-                            .dropna()
-                            .head(10)
-                            .tolist()
-                        )
-                    if "tech_name_ko" in comp_df.columns:
-                        comp_titles_ko10 = (
-                            comp_df["tech_name_ko"]
-                            .fillna("")
-                            .astype(str)
-                            .map(str.strip)
-                            .replace("", pd.NA)
-                            .dropna()
-                            .head(10)
-                            .tolist()
-                        )
-            except Exception:
-                comp_titles_en10, comp_titles_ko10 = [], []
-
-            # 9) 최종 완료: 구성기술 CSV 전송
+            # 구성기술 CSV base64 + titles 10개
             comp_csv_b64 = _b64(comp_csv_text)
-            tracker.update_step("finalize", 1.0)
+            comp_df = pd.read_csv(io.StringIO(comp_csv_text)) if comp_csv_text else pd.DataFrame()
+            comp_titles_en10: List[str] = []
+            comp_titles_ko10: List[str] = []
+            if not comp_df.empty:
+                if "tech_name_en" in comp_df.columns:
+                    comp_titles_en10 = (
+                        comp_df["tech_name_en"].fillna("").astype(str).map(str.strip).replace("", pd.NA).dropna().head(10).tolist()
+                    )
+                if "tech_name_ko" in comp_df.columns:
+                    comp_titles_ko10 = (
+                        comp_df["tech_name_ko"].fillna("").astype(str).map(str.strip).replace("", pd.NA).dropna().head(10).tolist()
+                    )
+
+            # ② 구성기술 결과 이벤트
+            tracker.update_step("component_result", 1.0)
             yield j({
-                **tracker.pack("finalize", "component", 1.0),
-                "step_label": "파이프라인 완료",
+                **tracker.pack("component_result", "component", 1.0),
+                "step_label": "구성기술 결과 전송",
+                "step": "component_result",
                 "result": {
                     "outputs": {
                         "files": [
@@ -559,6 +518,119 @@ async def run_pipeline(
                     "summary": {
                         "titles_en": comp_titles_en10,
                         "titles_ko": comp_titles_ko10
+                    },
+                    "run_id": rid,
+                },
+            })
+
+            # --- 계보도 데이터 구성 ---
+            # (0) 유틸: 구성클러스터 컬럼 자동 탐색
+            def _resolve_cluster_col(df: pd.DataFrame, preferred: Optional[str] = None) -> str:
+                cand = []
+                if preferred:
+                    cand.append(preferred)
+                cand += ["cluster_id", "label", "cluster", "cluster_idx", "kmeans_label"]
+                for c in cand:
+                    if c in df.columns:
+                        return c
+                for c in df.columns:
+                    if "cluster" in c.lower():
+                        return c
+                raise KeyError(f"cannot resolve cluster column from df_component.columns={list(df.columns)}")
+
+            # (1) 요소 elements: flow docs 집계 + 이름
+            artifacts = summary["artifacts"]
+            flow_panel = _panel_from_artifacts_edges(artifacts["flow_edges_df"])
+            if "docs" not in flow_panel.columns:
+                flow_panel["docs"] = 1
+            flow_docs = flow_panel.groupby("flow_id", as_index=False)["docs"].sum()
+
+            elements_payload = []
+            if not naming_df.empty:
+                exist_cols = [c for c in ["flow_id", "tech_name_en", "tech_name_ko"] if c in naming_df.columns]
+                merged = naming_df[exist_cols].merge(flow_docs, on="flow_id", how="left")
+                for _, r in merged.iterrows():
+                    elements_payload.append({
+                        "id": int(r["flow_id"]),
+                        "name_en": str(r.get("tech_name_en", "") or ""),
+                        "name_ko": str(r.get("tech_name_ko", "") or ""),
+                        "docs": int(r.get("docs", 0) or 0),
+                    })
+
+            # (2) 구성 components: component_tech_id 문서수 + 이름
+            comp_docs = (
+                df_component.groupby("component_tech_id", as_index=False)
+                .size()
+                .rename(columns={"size": "docs"})
+            )
+            components_payload = []
+            if not comp_df.empty:
+                comp_nodes = comp_docs.merge(
+                    comp_df[["component_tech_id", "tech_name_en", "tech_name_ko"]],
+                    on="component_tech_id", how="left"
+                )
+            else:
+                comp_nodes = comp_docs.assign(tech_name_en="", tech_name_ko="")
+            for _, r in comp_nodes.iterrows():
+                components_payload.append({
+                    "id": int(r["component_tech_id"]),
+                    "name_en": str(r.get("tech_name_en", "") or ""),
+                    "name_ko": str(r.get("tech_name_ko", "") or ""),
+                    "docs": int(r.get("docs", 0) or 0),
+                })
+
+            # (3) edges: (flow_id, year, cluster_id) ↔ component_tech_id 매핑 후 groupby count
+            try:
+                preferred_label = summary.get("paths", {}).get("label_col")
+            except Exception:
+                preferred_label = None
+            cluster_col_in_component = _resolve_cluster_col(df_component, preferred_label)
+
+            needed_cols = ["year", cluster_col_in_component, "component_tech_id"]
+            missing = [c for c in needed_cols if c not in df_component.columns]
+            if missing:
+                raise KeyError(f"df_component missing columns {missing}; available={list(df_component.columns)}")
+
+            comp_map = (
+                df_component[needed_cols]
+                .rename(columns={cluster_col_in_component: "cluster_id"})
+                .dropna()
+                .copy()
+            )
+            comp_map["year"] = comp_map["year"].astype(int)
+            comp_map["cluster_id"] = comp_map["cluster_id"].astype(int)
+
+            flow_panel_edges = flow_panel.copy()
+            flow_panel_edges["year"] = flow_panel_edges["year"].astype(int)
+            flow_panel_edges["cluster_id"] = flow_panel_edges["cluster_id"].astype(int)
+
+            joined = flow_panel_edges.merge(comp_map, on=["year", "cluster_id"], how="left")
+            edges_df = (
+                joined.dropna(subset=["component_tech_id"])
+                .groupby(["flow_id", "component_tech_id"], as_index=False)
+                .size()
+                .rename(columns={"size": "weight"})
+            )
+            edges_payload = [
+                {
+                    "from_element_id": int(r["flow_id"]),
+                    "to_component_id": int(r["component_tech_id"]),
+                    "weight": int(r["weight"]),
+                }
+                for _, r in edges_df.iterrows()
+            ]
+
+            # ③ 시각화(계보도) 이벤트
+            tracker.update_step("visualize", 1.0)
+            yield j({
+                **tracker.pack("visualize", "component", 1.0),
+                "step_label": "계보도 데이터 전송",
+                "step": "visualize",
+                "result": {
+                    "summary": {
+                        "components": components_payload,
+                        "elements": elements_payload,
+                        "edges": edges_payload
                     },
                     "run_id": rid,
                 },
