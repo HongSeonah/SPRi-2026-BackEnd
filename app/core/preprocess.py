@@ -1,4 +1,3 @@
-# app/core/preprocess.py
 from __future__ import annotations
 
 import json
@@ -114,34 +113,71 @@ def jsonl_to_csv(input_jsonl_path: str, output_csv_path: str) -> Tuple[int, str]
     return len(df), str(out_p)
 
 # =========================================================
-# DataFrame 기반 파생/필터 (원문 방식과 동일성 유지)
+# 범용 year 파생 로직 (모든 arXiv 형식 지원)
 # =========================================================
 def _derive_year(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    if "year" not in out.columns:
-        if "update_date" in out.columns:
-            out["year"] = (
-                out["update_date"]
-                .astype(str)
-                .map(lambda s: int(s[:4]) if s[:4].isdigit() else -1)
-                .astype(int)
-            )
-        else:
-            out["year"] = -1
+
+    # 0) year 이미 있으면 정규화 후 바로 사용
+    if "year" in out.columns:
+        out["year"] = (
+            out["year"]
+            .astype(str)
+            .map(lambda s: int(s[:4]) if s[:4].isdigit() else -1)
+            .astype(int)
+        )
+        return out
+
+    # 1) arXiv 전형적 날짜 컬럼 우선순위
+    date_candidates = []
+    if "update_date" in out.columns:
+        date_candidates.append("update_date")
+    if "published" in out.columns:
+        date_candidates.append("published")
+    if "fetch_month" in out.columns:
+        date_candidates.append("fetch_month")
+
+    # 2) 기타 date-like 컬럼 자동 탐색
+    if not date_candidates:
+        for c in out.columns:
+            cl = c.lower()
+            if ("date" in cl) or ("time" in cl) or ("publish" in cl):
+                date_candidates.append(c)
+
+    # 3) pandas datetime 파싱 먼저 시도
+    for col in date_candidates:
+        try:
+            out["year"] = pd.to_datetime(
+                out[col].astype(str), errors="coerce"
+            ).dt.year
+            if out["year"].notna().any():
+                out["year"] = out["year"].fillna(-1).astype(int)
+                return out
+        except Exception:
+            pass
+
+    # 4) 문자열 강제 슬라이싱 (YYYY만 필요한 경우)
+    for col in date_candidates:
+        out["year"] = (
+            out[col].astype(str).map(lambda s: int(s[:4]) if s[:4].isdigit() else -1)
+        ).astype(int)
+        if (out["year"] >= 0).any():
+            return out
+
+    # 5) 완전 실패 → 기존 fallback
+    out["year"] = -1
     return out
 
-
+# =========================================================
+# DataFrame 기반 파생/필터 (원문 방식 유지)
+# =========================================================
 def filter_df_before_year(df: pd.DataFrame, cutoff_year: int) -> pd.DataFrame:
-    """
-    원문과 동일 부등식: int(update_date[:4]) < cutoff_year
-    (연도 파싱 실패 -1 도 포함하는 원문 규칙 유지)
-    """
     df2 = _derive_year(df)
     yrs = pd.to_numeric(df2["year"], errors="coerce").fillna(-1).astype(int)
     return df2[yrs < int(cutoff_year)].copy().reset_index(drop=True)
 
 # =========================================================
-# 키워드 필터 (literal 포함검사)
+# 키워드 필터
 # =========================================================
 def _concat_text(row: pd.Series, cols: Sequence[str]) -> str:
     parts = []
@@ -188,9 +224,6 @@ def filter_df_by_keywords_literal(
 
 # =========================================================
 # 공개 전처리 엔트리포인트
-#  - 연도 파생/정리
-#  - (항상) 키워드 리터럴 필터: DEFAULT_KEYWORDS
-#  - progress_cb(processed:int, total:int, stage:str) 콜백 지원
 # =========================================================
 def run_preprocess(
     df: pd.DataFrame,
@@ -210,7 +243,7 @@ def run_preprocess(
     total_in = len(df)
     _ping(0, max(total_in, 1), "preprocess_start")
 
-    # 1) year 파생 + 제목/초록 비어있는 행 제거 (원문 규칙)
+    # 1) year 파생 + 제목/초록 정리
     out = _derive_year(df)
     title_col = "title" if "title" in out.columns else None
     abstr_col = "abstract" if "abstract" in out.columns else None
@@ -230,7 +263,7 @@ def run_preprocess(
 
     _ping(len(out), max(total_in, 1), "clean_done")
 
-    # 2) (항상 적용) 키워드 리터럴 필터 — DEFAULT_KEYWORDS
+    # 2) 키워드 리터럴 필터
     out = filter_df_by_keywords_literal(
         out,
         DEFAULT_KEYWORDS,
