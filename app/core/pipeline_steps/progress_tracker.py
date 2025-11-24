@@ -21,9 +21,7 @@ class ProgressTracker:
 
     COMPONENT_STEPS = [
         ("component_grouping", 0.30),
-        ("component_naming",   0.30),
-        ("component_result",   0.10),
-        ("visualize",          0.30),
+        ("component_naming", 0.70),
     ]
 
     def __init__(self):
