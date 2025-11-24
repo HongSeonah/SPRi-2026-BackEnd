@@ -4,7 +4,7 @@ from __future__ import annotations
 import gc
 import re
 from pathlib import Path
-from typing import Iterable, Tuple, Dict, Any, List
+from typing import Iterable, Tuple, Dict, Any, List, Optional, Callable
 
 import numpy as np
 import pandas as pd
@@ -294,12 +294,9 @@ def run_clustering(
     text_cols: Iterable[str] | None = DEFAULT_TEXT_COLS,
     output_root: Path | str = ROOT,
     match_threshold: float = 0.08,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    반환: (df_clustered_all, summary_dict)
-    - df_clustered_all: 각 연도별 라벨이 추가된 전체 DF
-    - summary_dict: {"keywords":[...], "titles":[...], "paths": {...}, "artifacts": {...}}
-    """
+
     # 디스크 경로는 참고 정보만 제공(실제 파일 저장 X)
     output_root = Path(output_root).resolve()
     yearly_dir = output_root / "yearly_v4"
@@ -313,16 +310,30 @@ def run_clustering(
     counts_by_year: Dict[int, pd.DataFrame] = {}
     tfidf_by_year: Dict[int, pd.DataFrame] = {}
 
+    total_years = len(years)
+    processed_years = 0
+    if progress_cb:
+        progress_cb(0, total_years)
+
     for y in years:
         df_y = df_embed[df_embed[year_col] == y].copy()
         if df_y.empty:
+            processed_years += 1
+            if progress_cb:
+                progress_cb(processed_years, total_years)
             continue
+
         df_y_labeled, counts_df, tfidf_df = _cluster_one_year(
             df_y, y, n_clusters, embed_col, text_cols
         )
+
         clustered_parts.append(df_y_labeled)
         counts_by_year[int(y)] = counts_df
         tfidf_by_year[int(y)] = tfidf_df
+
+        processed_years += 1
+        if progress_cb:
+            progress_cb(processed_years, total_years)
 
     if not clustered_parts:
         return df_embed.copy(), {"keywords": [], "titles": [], "paths": {}, "artifacts": {}}
@@ -363,7 +374,6 @@ def run_clustering(
     flow_df = pd.DataFrame(rows)
 
     # ---- summary 산출 ----
-    # 키워드: 모든 연도 TF-IDF 상위 용어 점수 합 상위 100개
     kw_counter: Dict[str, float] = {}
     for tdf in tfidf_by_year.values():
         if not {"term","tfidf"} <= set(tdf.columns):
@@ -371,11 +381,10 @@ def run_clustering(
         for _, rr in tdf.iterrows():
             term = str(rr["term"])
             score = float(rr.get("tfidf", 0.0))
-            if term:  # 빈 문자열 방지
+            if term:
                 kw_counter[term] = kw_counter.get(term, 0.0) + score
     keywords = [t for t, _ in sorted(kw_counter.items(), key=lambda x: x[1], reverse=True)[:100]]
 
-    # 대표 타이틀: 연도×클러스터 샘플 1~2개
     titles: List[str] = []
     for (y, cid), g in df_all_clustered.groupby([year_col, label_col]):
         cols = _pick_text_cols(g, text_cols)
@@ -400,8 +409,5 @@ def run_clustering(
             "flow_edges_df": flow_df.copy()
         }
     }
-
-    del clustered_parts
-    gc.collect()
 
     return df_all_clustered, summary
