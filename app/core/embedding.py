@@ -21,7 +21,7 @@ try:
 except Exception:
     STOPWORDS = set()
 
-_WORD_RE = re.compile(r"\b[a-zA-Z]{3,}\b")
+_WORD_RE = re.compile(r"[가-힣A-Za-z0-9]{2,}")
 
 def _clean_text(text: str) -> str:
     text = str(text).lower()
