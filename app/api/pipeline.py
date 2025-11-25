@@ -485,6 +485,7 @@ async def run_pipeline(
 
             def _cluster_cb(processed: int, total: int):
                 try:
+                    loop = asyncio.get_event_loop()
                     loop.call_soon_threadsafe(cluster_q.put_nowait, (processed, total))
                 except:
                     pass
@@ -493,7 +494,7 @@ async def run_pipeline(
                 run_clustering,
                 df_embed,
                 n_clusters,
-                "year",  # year_col (기본값 사용)
+                "year",  # year_col
                 "embedding",  # embed_col
                 ("title",),  # text_cols
                 "cluster_out",  # output_root
@@ -501,16 +502,20 @@ async def run_pipeline(
                 _cluster_cb  # 진행률 콜백 연결
             ))
 
+            # 클러스터링 진행률/ETA 스트리밍 루프
             while not task_cluster.done():
                 await asyncio.sleep(1.0)
 
+                got_new = False
                 try:
                     while True:
                         last_cluster = cluster_q.get_nowait()
+                        got_new = True
                 except asyncio.QueueEmpty:
                     pass
 
-                if last_cluster is None:
+                # 새 콜백이 없으면 → 그냥 하트비트만 전송 (processed/total/ETA 없음)
+                if not got_new:
                     yield j(make_heartbeat(
                         phase="element",
                         step_name="clustering",
@@ -523,6 +528,7 @@ async def run_pipeline(
                     ))
                     continue
 
+                # 새 콜백이 있을 때만 진행률/ETA 갱신
                 processed, total = last_cluster
                 frac = processed / max(total, 1)
                 state.update_progress(frac)
@@ -539,6 +545,7 @@ async def run_pipeline(
                     meta={"processed": processed, "total": total}
                 ))
 
+            # 실제 클러스터링 완료 시점
             df_clustered, summary = await task_cluster
 
             if not isinstance(summary, dict) or "artifacts" not in summary:
