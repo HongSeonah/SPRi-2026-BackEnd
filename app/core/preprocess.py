@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Iterable, IO, Optional, List, Tuple, Sequence, Callable
 
@@ -15,7 +16,7 @@ router = APIRouter()
 DEFAULT_KEYWORDS = ['data', 'algorithm', 'software', 'reality', 'virtual', 'augmented']
 
 # =========================================================
-# JSONL 유틸 (update_date[:4].isdigit() + int < cutoff)
+# JSONL 유틸 (update_date)
 # =========================================================
 def _iter_jsonl_lines(
     fp: IO[str],
@@ -35,6 +36,9 @@ def _iter_jsonl_lines(
 
 
 def _year_from_update_date_like_original(update_date: str) -> int:
+    """
+    구버전에서 사용했던 단순 함수 — 이제는 사용 빈도가 낮음.
+    """
     s = str(update_date)
     y4 = s[:4]
     return int(y4) if y4.isdigit() else -1
@@ -58,7 +62,7 @@ def filter_before_year_stream_to_df(fp: IO[str], cutoff_year: int) -> pd.DataFra
     return pd.DataFrame(rows)
 
 # =========================================================
-# 파일 경로 기반 I/O (원문 스크립트와 동일)
+# 파일 기반 JSONL → JSONL (cutoff)
 # =========================================================
 def count_until_year_from_path(input_path: str, cutoff_year: int = 2026) -> int:
     p = Path(input_path)
@@ -113,63 +117,100 @@ def jsonl_to_csv(input_jsonl_path: str, output_csv_path: str) -> Tuple[int, str]
     return len(df), str(out_p)
 
 # =========================================================
-# 범용 year 파생 로직 (모든 arXiv 형식 지원)
+# --- 완전 강화된 year 파생 로직 ---
 # =========================================================
+
+RE_YEAR = re.compile(r"(19|20)\d{2}")
+RE_ARXIV_OLD = re.compile(r"^(?P<yy>\d{2})(?P<mm>\d{2})\.\d+")
+RE_ARXIV_NEW = re.compile(r"^(?P<yy>\d{2})(?P<mm>\d{2})\d{3,5}")
+
+def _extract_year_from_arxiv_id(s: str) -> int:
+    if not s:
+        return -1
+    s = s.strip()
+
+    m = RE_ARXIV_OLD.match(s)
+    if m:
+        yy = int(m.group("yy"))
+        return 2000 + yy
+
+    m = RE_ARXIV_NEW.match(s)
+    if m:
+        yy = int(m.group("yy"))
+        return 2000 + yy
+
+    return -1
+
+
+def _extract_year_from_any_date(s: str) -> int:
+    if not s:
+        return -1
+
+    s = str(s)
+
+    # 1) pandas datetime
+    try:
+        dt = pd.to_datetime(s, errors="raise")
+        return int(dt.year)
+    except:
+        pass
+
+    # 2) YYYYMMDD
+    if s.isdigit() and len(s) == 8:
+        return int(s[:4])
+
+    # 3) 문자열 내부에서 4자리 연도
+    m = RE_YEAR.search(s)
+    if m:
+        return int(m.group())
+
+    return -1
+
+
 def _derive_year(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    # 0) year 이미 있으면 정규화 후 바로 사용
+    # 0) year 컬럼 있는 경우
     if "year" in out.columns:
-        out["year"] = (
-            out["year"]
-            .astype(str)
-            .map(lambda s: int(s[:4]) if s[:4].isdigit() else -1)
-            .astype(int)
-        )
+        out["year"] = out["year"].apply(_extract_year_from_any_date)
         return out
 
-    # 1) arXiv 전형적 날짜 컬럼 우선순위
-    date_candidates = []
-    if "update_date" in out.columns:
-        date_candidates.append("update_date")
-    if "published" in out.columns:
-        date_candidates.append("published")
-    if "fetch_month" in out.columns:
-        date_candidates.append("fetch_month")
-
-    # 2) 기타 date-like 컬럼 자동 탐색
-    if not date_candidates:
-        for c in out.columns:
-            cl = c.lower()
-            if ("date" in cl) or ("time" in cl) or ("publish" in cl):
-                date_candidates.append(c)
-
-    # 3) pandas datetime 파싱 먼저 시도
-    for col in date_candidates:
-        try:
-            out["year"] = pd.to_datetime(
-                out[col].astype(str), errors="coerce"
-            ).dt.year
-            if out["year"].notna().any():
-                out["year"] = out["year"].fillna(-1).astype(int)
-                return out
-        except Exception:
-            pass
-
-    # 4) 문자열 강제 슬라이싱 (YYYY만 필요한 경우)
-    for col in date_candidates:
-        out["year"] = (
-            out[col].astype(str).map(lambda s: int(s[:4]) if s[:4].isdigit() else -1)
-        ).astype(int)
-        if (out["year"] >= 0).any():
+    # 1) arXiv ID 기반
+    id_candidates = [c for c in out.columns if "id" in c.lower()]
+    for c in id_candidates:
+        yrs = out[c].astype(str).apply(_extract_year_from_arxiv_id)
+        if (yrs >= 2007).any():
+            out["year"] = yrs
             return out
 
-    # 5) 완전 실패 → 기존 fallback
-    out["year"] = -1
+    # 2) date-like 컬럼
+    date_candidates = []
+    for c in out.columns:
+        cl = c.lower()
+        if "date" in cl or "time" in cl or "publish" in cl or "created" in cl:
+            date_candidates.append(c)
+
+    for c in date_candidates:
+        yrs = out[c].astype(str).apply(_extract_year_from_any_date)
+        if (yrs >= 1900).any():
+            out["year"] = yrs
+            return out
+
+    # 3) fallback: 행 전체 문자열에서 연도 추출
+    fallback_years = []
+    for _, row in out.iterrows():
+        y = -1
+        for v in row:
+            y = _extract_year_from_any_date(str(v))
+            if y != -1:
+                break
+        fallback_years.append(y)
+
+    out["year"] = fallback_years
     return out
 
 # =========================================================
-# DataFrame 기반 파생/필터 (원문 방식 유지)
+# DataFrame 기반 year-filter
 # =========================================================
 def filter_df_before_year(df: pd.DataFrame, cutoff_year: int) -> pd.DataFrame:
     df2 = _derive_year(df)
@@ -207,16 +248,16 @@ def filter_df_by_keywords_literal(
             text = _concat_text(row, use_cols).lower()
             if use_regex:
                 import re
-                return any(re.search(k, text) is not None for k in kw_list)
+                return any(re.search(k, text) for k in kw_list)
             return any(k in text for k in kw_list)
     else:
-        kw_list = [str(k) for k in keywords]
+        kw_list = keywords
 
         def _hit(row: pd.Series) -> bool:
             text = _concat_text(row, use_cols)
             if use_regex:
                 import re
-                return any(re.search(k, text) is not None for k in kw_list)
+                return any(re.search(k, text) for k in kw_list)
             return any(k in text for k in kw_list)
 
     mask = proc.apply(_hit, axis=1)
@@ -232,19 +273,21 @@ def run_preprocess(
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
     **kwargs
 ) -> pd.DataFrame:
+
     def _ping(proc: int, tot: int, stage: str):
         if progress_cb:
             try:
-                progress_cb(int(proc), int(tot), str(stage))
-            except Exception:
+                progress_cb(int(proc), int(tot), stage)
+            except:
                 pass
 
-    # 0) 시작
     total_in = len(df)
     _ping(0, max(total_in, 1), "preprocess_start")
 
-    # 1) year 파생 + 제목/초록 정리
+    # 1) year 파생
     out = _derive_year(df)
+
+    # title/abstract 존재 처리
     title_col = "title" if "title" in out.columns else None
     abstr_col = "abstract" if "abstract" in out.columns else None
 
@@ -253,9 +296,10 @@ def run_preprocess(
     if abstr_col:
         out[abstr_col] = out[abstr_col].astype(str).fillna("")
 
+    # 빈 제목/초록 제거
     if title_col and abstr_col:
-        mask_keep = (out[title_col].str.len() > 0) | (out[abstr_col].str.len() > 0)
-        out = out[mask_keep]
+        mask = (out[title_col].str.len() > 0) | (out[abstr_col].str.len() > 0)
+        out = out[mask]
     elif title_col:
         out = out[out[title_col].str.len() > 0]
     elif abstr_col:
@@ -263,17 +307,22 @@ def run_preprocess(
 
     _ping(len(out), max(total_in, 1), "clean_done")
 
-    # 2) 키워드 리터럴 필터
+    # 2) 키워드 필터
     out = filter_df_by_keywords_literal(
         out,
         DEFAULT_KEYWORDS,
-        text_cols=tuple([c for c in ("title", "abstract") if c in out.columns]),
+        text_cols=[c for c in ("title", "abstract") if c in out.columns],
         case_insensitive=True,
         use_regex=False,
     )
+
     _ping(len(out), max(total_in, 1), "keyword_filter_done")
 
-    # 마무리
-    out = out.drop(columns=["__text__"], errors="ignore").reset_index(drop=True)
-    _ping(len(out), max(total_in, 1), "preprocess_done")
+    # 정리
+    out = out.reset_index(drop=True)
+
+    # year 컬럼 손실 방지
+    if "year" not in out.columns:
+        out["year"] = -1
+
     return out

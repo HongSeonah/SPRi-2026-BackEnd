@@ -308,12 +308,38 @@ def run_tech_naming(_prompt_ignored: str | None = None, *,
 
     # 1) 패널 구성(artifacts의 flow_edges_df 사용)
     fedges = artifacts.get("flow_edges_df", pd.DataFrame())
-    if fedges.empty:
-        raise RuntimeError("artifacts.flow_edges_df 가 비었습니다.")
-    panel = _panel_from_artifacts_edges(fedges)
-    if panel.empty:
-        raise RuntimeError("flow_edges_df 로부터 panel 생성에 실패했습니다(비어있음).")
-    panel["year"] = panel["year"].astype(int)
+
+    if fedges is None or fedges.empty:
+        # --- 단일 연도 fallback 모드 ---
+        years = artifacts.get("years", [])
+        if len(years) == 1:
+            y = int(years[0])
+
+            # clustered_by_year 에서 해당 연도 df 가져오기
+            df_year = artifacts["clustered_by_year"][y]
+
+            # label_col 가져오기
+            label_col = artifacts.get("label_col", None)
+            if label_col is None:
+                raise RuntimeError("label_col 정보가 artifacts에 없습니다.")
+
+            # 패널 구성 (단일 연도 → cluster_id만 나열)
+            panel = (
+                df_year[["year", label_col]]
+                .drop_duplicates()
+                .rename(columns={label_col: "cluster_id"})
+            )
+            panel["year"] = panel["year"].astype(int)
+
+        else:
+            # 연도 여러 개인데 flow_edges_df가 비어 있으면 비정상
+            raise RuntimeError("flow_edges_df 가 비어 있는데 연도가 하나가 아닙니다.")
+    else:
+        # --- flow 기반 패널 구성 ---
+        panel = _panel_from_artifacts_edges(fedges)
+        if panel.empty:
+            raise RuntimeError("flow_edges_df 로부터 panel 생성 실패")
+        panel["year"] = panel["year"].astype(int)
 
     # 2) 문서수 합 기준 상위 N개 flow 선정
     def _select_top_flows(panel_df: pd.DataFrame, n: int) -> List[int]:

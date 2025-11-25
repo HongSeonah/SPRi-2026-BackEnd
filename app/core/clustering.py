@@ -90,17 +90,33 @@ def _embed_matrix(df: pd.DataFrame, col: str) -> np.ndarray:
 # ------------------------------------------------------------
 # GLOBAL TF-IDF (한 번만 fit)
 # ------------------------------------------------------------
-def _build_global_tfidf(df: pd.DataFrame, text_cols: Iterable[str]) -> TfidfVectorizer:
-    all_text = _join(df, text_cols)
+def _build_global_tfidf(df: pd.DataFrame, text_cols) -> TfidfVectorizer:
+    # 텍스트 결합 + 문자열 강제 변환
+    all_text = _join(df, text_cols).astype(str)
+
+    # 1) 비어있으면 fallback
+    if all_text.str.len().sum() == 0:
+        vec = TfidfVectorizer(token_pattern=r"(?u)\b\w+\b")
+        vec.fit(["dummy token"])
+        return vec
+
     vec = TfidfVectorizer(
         tokenizer=_simple_tokenize,
         token_pattern=None,
         ngram_range=(1, 2),
-        min_df=2,
+        min_df=1,
         max_df=0.98,
-        max_features=120_000,
+        max_features=120000
     )
-    vec.fit(all_text)
+
+    # 2) fit 중 empty vocabulary 방어
+    try:
+        vec.fit(all_text)
+    except ValueError:
+        # fallback vocab
+        vec = TfidfVectorizer(token_pattern=r"(?u)\b\w+\b")
+        vec.fit(["dummy token"])
+
     return vec
 
 
