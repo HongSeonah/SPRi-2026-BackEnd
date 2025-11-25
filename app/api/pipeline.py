@@ -493,7 +493,7 @@ async def run_pipeline(
                 run_clustering,
                 df_embed,
                 n_clusters,
-                None,  # year_col (기본값 사용)
+                "year",  # year_col (기본값 사용)
                 "embedding",  # embed_col
                 ("title",),  # text_cols
                 "cluster_out",  # output_root
