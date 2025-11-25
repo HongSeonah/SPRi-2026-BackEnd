@@ -119,7 +119,7 @@ def _cluster_one_year(
     df_year = df_year.reset_index(drop=True)
 
     # 1) 임베딩 정규화 + 차원축소 (소표본 가드)
-    X = _embedding_matrix(df_year, embed_col)
+    X = _embedding_matrix(df_year, embed_col).astype(np.float32)
     Xn = normalize(X, axis=1)
 
     n_docs, n_feat = Xn.shape[0], Xn.shape[1]
@@ -131,7 +131,12 @@ def _cluster_one_year(
 
     # 2) KMeans (소표본 가드)
     k_eff = max(1, min(k, n_docs))   # 샘플 수보다 큰 k 방지
-    mbk = MiniBatchKMeans(n_clusters=k_eff, random_state=42, n_init="auto")
+    mbk = MiniBatchKMeans(
+        n_clusters=k_eff,
+        batch_size=16,  # 메모리 안정성 대폭 증가
+        random_state=42,
+        n_init="auto",
+    )
     labels = mbk.fit_predict(Xr)
     label_col = f"cluster_k{k}"      # 열 이름은 원래 k 유지(유니크 라벨 수는 k_eff)
     df_year[label_col] = labels
