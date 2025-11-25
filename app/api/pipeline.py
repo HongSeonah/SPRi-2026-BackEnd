@@ -485,7 +485,6 @@ async def run_pipeline(
 
             def _cluster_cb(processed: int, total: int):
                 try:
-                    loop = asyncio.get_event_loop()
                     loop.call_soon_threadsafe(cluster_q.put_nowait, (processed, total))
                 except:
                     pass
@@ -499,23 +498,20 @@ async def run_pipeline(
                 ("title",),  # text_cols
                 "cluster_out",  # output_root
                 0.08,  # match_threshold
-                _cluster_cb  # 진행률 콜백 연결
+                _cluster_cb  # 진행률 콜백
             ))
 
-            # 클러스터링 진행률/ETA 스트리밍 루프
             while not task_cluster.done():
                 await asyncio.sleep(1.0)
 
-                got_new = False
                 try:
                     while True:
                         last_cluster = cluster_q.get_nowait()
-                        got_new = True
                 except asyncio.QueueEmpty:
                     pass
 
-                # 새 콜백이 없으면 → 그냥 하트비트만 전송 (processed/total/ETA 없음)
-                if not got_new:
+                # 콜백이 아직 안 온 상태 → 단순 하트비트만
+                if last_cluster is None:
                     yield j(make_heartbeat(
                         phase="element",
                         step_name="clustering",
@@ -528,24 +524,38 @@ async def run_pipeline(
                     ))
                     continue
 
-                # 새 콜백이 있을 때만 진행률/ETA 갱신
                 processed, total = last_cluster
-                frac = processed / max(total, 1)
-                state.update_progress(frac)
-                eta_sec = state.timer.eta_seconds(processed, total)
+                total = max(total, 1)
+                frac = processed / total
+
+                # 연도별 클러스터링은 전체 클러스터링 작업의 0.9 정도로만 반영
+                # (나머지 0.1 은 year-matching / summary 계산 영역)
+                if processed < total:
+                    step_frac = min(frac * 0.9, 0.9)  # 0 ~ 0.9
+                    eta_sec = state.timer.eta_seconds(processed, total)
+                else:
+                    # 콜백은 끝까지 왔지만 run_clustering 내부 후처리가 남아있는 구간
+                    step_frac = 0.95
+                    eta_sec = None
+
+                state.update_progress(step_frac)
 
                 yield j(make_heartbeat(
                     phase="element",
                     step_name="clustering",
-                    progress=frac,
+                    progress=step_frac,
                     element_progress=state.progress.element_progress(),
                     component_progress=state.progress.component_progress(),
                     overall_progress=state.progress.overall_progress(),
                     eta_seconds=eta_sec,
-                    meta={"processed": processed, "total": total}
+                    meta={
+                        "processed": processed,
+                        "total": total,
+                        "step_label": "클러스터링 진행 중"
+                    }
                 ))
 
-            # 실제 클러스터링 완료 시점
+            # 실제 run_clustering 완료 시점에서 100% 확정
             df_clustered, summary = await task_cluster
 
             if not isinstance(summary, dict) or "artifacts" not in summary:
