@@ -465,7 +465,7 @@ async def run_pipeline(
             ))
 
             # ============================================================
-            # 5) 클러스터링
+            # 5) 클러스터링 (heartbeat + ETA)
             # ============================================================
             state.start_step("clustering", "element")
 
@@ -480,13 +480,72 @@ async def run_pipeline(
                 meta={"step_label": "클러스터링 시작"}
             ))
 
-            # 클러스터링 실행
-            df_clustered, summary = await asyncio.to_thread(run_clustering, df_embed, n_clusters)
+            cluster_q: asyncio.Queue = asyncio.Queue()
+            last_cluster = None
+
+            def _cluster_cb(processed: int, total: int):
+                try:
+                    loop.call_soon_threadsafe(cluster_q.put_nowait, (processed, total))
+                except:
+                    pass
+
+            task_cluster = asyncio.create_task(asyncio.to_thread(
+                run_clustering,
+                df_embed,
+                n_clusters,
+                None,  # year_col (기본값 사용)
+                "embedding",  # embed_col
+                ("title",),  # text_cols
+                "cluster_out",  # output_root
+                0.08,  # match_threshold
+                _cluster_cb  # 진행률 콜백 연결
+            ))
+
+            while not task_cluster.done():
+                await asyncio.sleep(1.0)
+
+                try:
+                    while True:
+                        last_cluster = cluster_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+
+                if last_cluster is None:
+                    yield j(make_heartbeat(
+                        phase="element",
+                        step_name="clustering",
+                        progress=state.progress._el_progress["clustering"],
+                        element_progress=state.progress.element_progress(),
+                        component_progress=state.progress.component_progress(),
+                        overall_progress=state.progress.overall_progress(),
+                        eta_seconds=None,
+                        meta={"step_label": "클러스터링 하트비트"}
+                    ))
+                    continue
+
+                processed, total = last_cluster
+                frac = processed / max(total, 1)
+                state.update_progress(frac)
+                eta_sec = state.timer.eta_seconds(processed, total)
+
+                yield j(make_heartbeat(
+                    phase="element",
+                    step_name="clustering",
+                    progress=frac,
+                    element_progress=state.progress.element_progress(),
+                    component_progress=state.progress.component_progress(),
+                    overall_progress=state.progress.overall_progress(),
+                    eta_seconds=eta_sec,
+                    meta={"processed": processed, "total": total}
+                ))
+
+            df_clustered, summary = await task_cluster
 
             if not isinstance(summary, dict) or "artifacts" not in summary:
                 raise RuntimeError("artifacts 누락")
 
             state.update_progress(1.0)
+
             yield j(make_heartbeat(
                 phase="element",
                 step_name="clustering",
